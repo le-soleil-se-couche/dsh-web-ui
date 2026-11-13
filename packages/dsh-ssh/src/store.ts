@@ -1,22 +1,25 @@
 /**
- * Host config store: one JSON file (`~/.dsh/dsh-ssh.json`) holding every
+ * Host config store: one JSON file (`$DSH_HOME/dsh-ssh.json`, defaulting
+ * to `~/.dsh`) holding every
  * SSH host entry, written atomically (tmp + rename). Also parses the user's
  * standard `~/.ssh/config` for one-shot import. Secrets (passwords,
  * passphrases) live in this user-owned file in plaintext — same trust model
  * as ssh-skill's annotated ssh-config comments; document it, never log it.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import type { HostPayload, ImportResult, SshHostEntry, SshHostSummary } from './protocol.ts'
+import { dshHome } from './dsh-home.ts'
+import type { HostPayload, ImportResult, ImportSkipBlock, ImportSkipReason, SshHostEntry, SshHostSummary } from './protocol.ts'
+import { readSshConfigBlocks } from './ssh-config.ts'
 
 /** File format version. */
 const FORMAT_VERSION = 1
 
-/** Store file location: <home>/.dsh/dsh-ssh.json. */
+/** Store file location: $DSH_HOME/dsh-ssh.json (defaults to ~/.dsh). */
 export function storePath(): string {
-  return join(homedir(), '.dsh', 'dsh-ssh.json')
+  return join(dshHome(), 'dsh-ssh.json')
 }
 
 /** The user's standard OpenSSH config path. */
@@ -38,12 +41,15 @@ export function validateHostPayload(payload: unknown): string | undefined {
   const auth = p.auth as Record<string, unknown> | undefined
   if (auth !== undefined) {
     if (typeof auth !== 'object' || auth === null) return 'auth must be an object'
-    if (auth.kind !== 'key' && auth.kind !== 'password') return 'auth.kind must be key or password'
+    if (auth.kind !== 'key' && auth.kind !== 'password' && auth.kind !== 'agent') return 'auth.kind must be key, password or agent'
     if (auth.kind === 'key' && (typeof auth.keyPath !== 'string' || auth.keyPath.trim() === '')) {
       return 'auth.keyPath is required for key auth'
     }
     if (auth.kind === 'password' && auth.password !== undefined && typeof auth.password !== 'string') {
       return 'auth.password must be a string when provided'
+    }
+    if (auth.kind === 'agent' && auth.agentPath !== undefined && typeof auth.agentPath !== 'string') {
+      return 'auth.agentPath must be a string when provided'
     }
   }
   if (p.port !== undefined && (typeof p.port !== 'number' || !Number.isInteger(p.port) || p.port < 1 || p.port > 65535)) {
@@ -52,8 +58,22 @@ export function validateHostPayload(payload: unknown): string | undefined {
   if (p.proxyJump !== undefined && (!Array.isArray(p.proxyJump) || p.proxyJump.some(x => typeof x !== 'string' || x === ''))) {
     return 'proxyJump must be an array of alias strings'
   }
+  if (p.proxyCommand !== undefined && typeof p.proxyCommand !== 'string') {
+    return 'proxyCommand must be a string when provided'
+  }
+  // OpenSSH resolves ProxyCommand and ProxyJump by "whichever appears first in
+  // the config"; a stored entry has no order, so the combination is rejected
+  // instead of silently picking one transport.
+  const proxyCommand = typeof p.proxyCommand === 'string' ? normalizeProxyCommand(p.proxyCommand) : undefined
+  const proxyJump = Array.isArray(p.proxyJump) ? p.proxyJump as string[] : []
+  if (proxyCommand !== undefined && proxyJump.length > 0) {
+    return 'proxyCommand and proxyJump cannot be combined — pick one transport per host'
+  }
   if (p.tags !== undefined && (!Array.isArray(p.tags) || p.tags.some(x => typeof x !== 'string'))) {
     return 'tags must be an array of strings'
+  }
+  if (p.forwardAgent !== undefined && typeof p.forwardAgent !== 'boolean') {
+    return 'forwardAgent must be a boolean'
   }
   return undefined
 }
@@ -101,6 +121,8 @@ export class HostStore {
     let keyReady = true
     if (entry.auth.kind === 'key' && entry.auth.keyPath) {
       keyReady = existsSync(expandHome(entry.auth.keyPath))
+    } else if (entry.auth.kind === 'agent') {
+      keyReady = false
     }
     return {
       alias: entry.alias,
@@ -110,12 +132,16 @@ export class HostStore {
       auth: entry.auth.kind,
       keyReady,
       proxyJump: [...entry.proxyJump],
+      ...(entry.proxyCommand !== undefined ? { proxyCommand: entry.proxyCommand } : {}),
       // Optional fields are spread conditionally: the tool bridge rejects
       // undefined-valued properties as non-lossless JSON.
       ...(entry.description !== undefined ? { description: entry.description } : {}),
       ...(entry.environment !== undefined ? { environment: entry.environment } : {}),
       tags: [...entry.tags],
       ...(entry.location !== undefined ? { location: entry.location } : {}),
+      // Always a definite boolean, unlike the conditional optional fields:
+      // the tool bridge rejects undefined-valued JSON properties.
+      forwardAgent: entry.forwardAgent === true,
       createdAt: entry.createdAt,
       updatedAt: entry.updatedAt,
     }
@@ -143,12 +169,17 @@ export class HostStore {
         keyPath: payload.auth.kind === 'key' ? expandHome(payload.auth.keyPath?.trim() ?? '') : undefined,
         passphrase: payload.auth.kind === 'key' ? payload.auth.passphrase ?? undefined : undefined,
         password: payload.auth.kind === 'password' ? payload.auth.password : undefined,
+        agentPath: payload.auth.kind === 'agent' ? normalizeAgentPath(payload.auth.agentPath) : undefined,
       },
       proxyJump: [...(payload.proxyJump ?? [])],
+      proxyCommand: normalizeProxyCommand(payload.proxyCommand),
       description: payload.description?.trim() || undefined,
       environment: payload.environment?.trim() || undefined,
       tags: [...(payload.tags ?? [])].map(tag => tag.trim()).filter(tag => tag !== ''),
       location: payload.location?.trim() || undefined,
+      // Stored only when enabled, so a store file written without agent
+      // forwarding stays byte-identical to the pre-feature format.
+      forwardAgent: payload.forwardAgent === true ? true : undefined,
       createdAt: now,
       updatedAt: now,
     }
@@ -176,6 +207,20 @@ export class HostStore {
     if (patch.proxyJump !== undefined && (!Array.isArray(patch.proxyJump) || patch.proxyJump.some(x => typeof x !== 'string' || x === ''))) {
       throw new Error('proxyJump must be an array of alias strings')
     }
+    if (patch.proxyCommand !== undefined && typeof patch.proxyCommand !== 'string') {
+      throw new Error('proxyCommand must be a string when provided')
+    }
+    if (patch.forwardAgent !== undefined && typeof patch.forwardAgent !== 'boolean') {
+      throw new Error('forwardAgent must be a boolean')
+    }
+    // The mutual exclusion is checked on the MERGED view: a patch that only
+    // adds one transport must not slip past a stored value of the other.
+    const mergedProxyCommand = patch.proxyCommand !== undefined
+      ? normalizeProxyCommand(patch.proxyCommand)
+      : entry.proxyCommand
+    if (mergedProxyCommand !== undefined && (patch.proxyJump ?? entry.proxyJump).length > 0) {
+      throw new Error('proxyCommand and proxyJump cannot be combined — pick one transport per host')
+    }
     if (patch.tags !== undefined && (!Array.isArray(patch.tags) || patch.tags.some(x => typeof x !== 'string'))) {
       throw new Error('tags must be an array of strings')
     }
@@ -184,12 +229,15 @@ export class HostStore {
     if (patch.user !== undefined) entry.user = patch.user.trim()
     if (patch.auth !== undefined) {
       const auth = patch.auth
-      if (auth.kind !== 'key' && auth.kind !== 'password') throw new Error('auth.kind must be key or password')
+      if (auth.kind !== 'key' && auth.kind !== 'password' && auth.kind !== 'agent') throw new Error('auth.kind must be key, password or agent')
       if (auth.kind === 'key' && (typeof auth.keyPath !== 'string' || auth.keyPath.trim() === '')) {
         throw new Error('auth.keyPath is required for key auth')
       }
       if (auth.kind === 'password' && auth.password !== undefined && typeof auth.password !== 'string') {
         throw new Error('auth.password must be a string when provided')
+      }
+      if (auth.kind === 'agent' && auth.agentPath !== undefined && typeof auth.agentPath !== 'string') {
+        throw new Error('auth.agentPath must be a string when provided')
       }
       // A changed key path with no passphrase means the new key has none;
       // only keep the old passphrase when the key path is unchanged.
@@ -203,13 +251,19 @@ export class HostStore {
           ? (auth.passphrase !== undefined ? auth.passphrase : (keyChanged ? undefined : entry.auth.passphrase))
           : undefined,
         password: auth.kind === 'password' ? auth.password : undefined,
+        agentPath: auth.kind === 'agent'
+          ? (auth.agentPath !== undefined ? normalizeAgentPath(auth.agentPath) : entry.auth.agentPath)
+          : undefined,
       }
     }
     if (patch.proxyJump !== undefined) entry.proxyJump = [...patch.proxyJump]
+    if (patch.proxyCommand !== undefined) entry.proxyCommand = mergedProxyCommand
     if (patch.description !== undefined) entry.description = patch.description.trim() || undefined
     if (patch.environment !== undefined) entry.environment = patch.environment.trim() || undefined
     if (patch.tags !== undefined) entry.tags = [...patch.tags].map(tag => tag.trim()).filter(tag => tag !== '')
     if (patch.location !== undefined) entry.location = patch.location.trim() || undefined
+    // PATCH semantics: an omitted key keeps the stored value, false clears it.
+    if (patch.forwardAgent !== undefined) entry.forwardAgent = patch.forwardAgent === true ? true : undefined
     entry.updatedAt = Date.now()
     this.save(file)
     return entry
@@ -226,98 +280,111 @@ export class HostStore {
 
   /**
    * Import hosts from `~/.ssh/config`: Host blocks with a single non-wildcard
-   * pattern and a HostName become entries (key auth via IdentityFile, jump
-   * hosts via ProxyJump). Existing aliases are skipped.
+   * pattern become entries (a missing HostName falls back to the pattern
+   * itself; key auth via IdentityFile; jump hosts via ProxyJump; ProxyCommand
+   * kept verbatim). `Include` files are expanded, and `Match` blocks,
+   * wildcard patterns, and aliases that already exist are skipped with a
+   * reason instead of silently disappearing.
    * @returns import statistics.
    */
   importFromSshConfig(): ImportResult {
     // Per-run statistics: a later import must not report earlier runs' skips.
-    this.skippedNames = new Set<string>()
+    this.skippedBlocks = []
     const configPath = this.sshConfigOverride ?? sshConfigPath()
-    if (!existsSync(configPath)) return { parsed: 0, added: 0, skipped: 0, skippedNames: [] }
-    const lines = readFileSync(configPath, 'utf8').split(/\r?\n/)
-    const blocks: { pattern: string; props: Record<string, string> }[] = []
-    let current: { pattern: string; props: Record<string, string> } | undefined
-    const skip = (name: string, seen: Set<string>): void => {
-      if (name !== '' && !seen.has(name)) {
-        seen.add(name)
-        this.skippedNames.add(name)
-      }
-    }
-    for (const raw of lines) {
-      const line = raw.trim()
-      if (line === '' || line.startsWith('#')) continue
-      const match = /^([A-Za-z0-9_\-]+)\s+(.+)$/.exec(line)
-      if (match === null) continue
-      const key = match[1].toLowerCase()
-      const value = match[2].trim()
-      if (key === 'host') {
-        current = { pattern: value, props: {} }
-        blocks.push(current)
-      } else if (current !== undefined) {
-        current.props[key] = value
-      }
+    if (!existsSync(configPath)) return { parsed: 0, added: 0, skipped: 0, skippedBlocks: [] }
+    const { blocks, skipped } = readSshConfigBlocks(configPath)
+    this.skippedBlocks = [...skipped]
+    const skip = (name: string, reason: ImportSkipReason): void => {
+      if (name === '') return
+      if (this.skippedBlocks.some(block => block.name === name)) return
+      this.skippedBlocks.push({ name, reason })
     }
     let added = 0
     for (const block of blocks) {
       const pattern = block.pattern.split(/\s+/)[0]
       if (pattern.includes('*') || pattern.includes('?')) {
-        skip(pattern, this.skippedNames)
+        skip(pattern, 'wildcard')
         continue
       }
-      const hostName = block.props.hostname
-      if (hostName === undefined || hostName === '') {
-        skip(pattern, this.skippedNames)
+      if (this.list().some(entry => entry.alias === pattern)) {
+        skip(pattern, 'existing')
         continue
       }
-      const existing = this.list().some(entry => entry.alias === pattern)
-      if (existing) {
-        skip(pattern, this.skippedNames)
-        continue
-      }
+      // A block without HostName is a usable OpenSSH entry: the Host pattern
+      // itself is the hostname.
+      const hostName = block.props.hostname !== undefined && block.props.hostname !== ''
+        ? block.props.hostname
+        : pattern
       const payload: HostPayload = {
         alias: pattern,
         host: hostName,
         port: block.props.port !== undefined ? Number.parseInt(block.props.port, 10) : 22,
         user: block.props.user ?? process.env.USER ?? 'root',
         auth: {
-          kind: block.props.identityfile !== undefined ? 'key' : 'password',
+          kind: block.props.identityfile !== undefined
+            ? 'key'
+            : block.props.identityagent !== undefined && block.props.identityagent.toLowerCase() !== 'none'
+              ? 'agent'
+              : 'password',
           keyPath: block.props.identityfile,
           password: block.props.password,
+          agentPath: block.props.identityagent !== undefined && block.props.identityagent.toLowerCase() !== 'none'
+            ? normalizeAgentPath(block.props.identityagent)
+            : undefined,
         },
         proxyJump: block.props.proxyjump !== undefined
           ? block.props.proxyjump.split(',').map(hop => hop.trim()).filter(hop => hop !== '')
           : [],
+        proxyCommand: block.props.proxycommand,
         description: block.props.description,
         environment: block.props.environment,
         tags: (block.props.tags ?? '').split(',').map(tag => tag.trim()).filter(tag => tag !== ''),
         location: block.props.location,
+        forwardAgent: parseForwardAgentValue(block.props.forwardagent),
       }
       try {
         this.create(payload)
         added += 1
       } catch {
-        // Unusable entry (bad alias grammar etc.) — count as skipped.
-        skip(pattern, this.skippedNames)
+        // Unusable entry (bad alias grammar, conflicting transports, ...).
+        skip(pattern, 'invalid')
       }
     }
-    return { parsed: blocks.length, added, skipped: this.skippedNames.size, skippedNames: [...this.skippedNames] }
+    return { parsed: blocks.length, added, skipped: this.skippedBlocks.length, skippedBlocks: [...this.skippedBlocks] }
   }
 
-  private skippedNames = new Set<string>()
+  private skippedBlocks: ImportSkipBlock[] = []
+
+  /**
+   * Last parsed store keyed by file identity. list/find ride every acquire
+   * and GUI refresh; re-reading and re-parsing the whole file each call is
+   * wasted work when the file has not changed. Any save invalidates.
+   */
+  private cache: { mtimeMs: number; size: number; file: StoreFile } | undefined
 
   private load(): StoreFile {
-    if (!existsSync(this.path)) return { version: FORMAT_VERSION, hosts: [] }
+    let stats: { mtimeMs: number; size: number }
+    try {
+      stats = statSync(this.path)
+    } catch {
+      this.cache = undefined
+      return { version: FORMAT_VERSION, hosts: [] }
+    }
+    if (this.cache !== undefined && this.cache.mtimeMs === stats.mtimeMs && this.cache.size === stats.size) {
+      return this.cache.file
+    }
     try {
       const parsed = JSON.parse(readFileSync(this.path, 'utf8')) as StoreFile
       if (typeof parsed !== 'object' || parsed === null || !Array.isArray(parsed.hosts)) {
         throw new Error('store file shape invalid')
       }
+      this.cache = { mtimeMs: stats.mtimeMs, size: stats.size, file: parsed }
       return parsed
     } catch {
       // A corrupt store must not brick the plugin — and must not be silently
       // overwritten by the next save: rename it aside for manual recovery
       // (the plugin then starts from an empty list).
+      this.cache = undefined
       try {
         renameSync(this.path, `${this.path}.corrupt-${Date.now()}`)
       } catch { /* best effort */ }
@@ -333,7 +400,41 @@ export class HostStore {
     // tmp file carries the 0600 mode through the rename.
     writeFileSync(tmp, JSON.stringify(file, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
     renameSync(tmp, this.path)
+    this.cache = undefined
   }
+}
+
+/** Normalize an agent endpoint for storage: trim, expand `~`, and resolve the SSH_AUTH_SOCK token. */
+export function normalizeAgentPath(agentPath: string | undefined): string | undefined {
+  const trimmed = agentPath?.trim()
+  if (trimmed === undefined || trimmed === '') return undefined
+  if (trimmed === 'SSH_AUTH_SOCK' || trimmed === '$SSH_AUTH_SOCK') {
+    const sock = process.env.SSH_AUTH_SOCK
+    return sock !== undefined && sock !== '' ? sock : undefined
+  }
+  return expandHome(trimmed)
+}
+
+/**
+ * Normalize a ProxyCommand for storage: trim, and treat an empty value or
+ * OpenSSH's `none` keyword as "no proxy command" (an explicit clear).
+ */
+export function normalizeProxyCommand(raw: string | undefined): string | undefined {
+  const trimmed = raw?.trim()
+  if (trimmed === undefined || trimmed === '') return undefined
+  if (trimmed.toLowerCase() === 'none') return undefined
+  return trimmed
+}
+
+/**
+ * Read an ssh_config `ForwardAgent` value into the stored boolean flag. Only
+ * an explicit yes/true/on enables forwarding; an absent value, no/false/off,
+ * and anything unrecognized leave it off instead of failing the import — an
+ * unknown keyword must never cost the user the whole Host block.
+ */
+export function parseForwardAgentValue(raw: string | undefined): boolean {
+  const value = raw?.trim().toLowerCase()
+  return value === 'yes' || value === 'true' || value === 'on'
 }
 
 /** Expand a leading `~` in a filesystem path. */

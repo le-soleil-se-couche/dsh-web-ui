@@ -1,12 +1,13 @@
 /**
  * Controller tests: orchestration — persistence, view state, navigation
- * awareness, and the full run loop (running → started(sessionId) → settled).
+ * awareness, and the Host run loop (run action → confirmed running state →
+ * settled frame).
  */
 import { describe, expect, it, vi } from 'vitest'
-import { BoardController, type ControllerDeps } from '../src/core/controller.ts'
-import { ExecutionService, type ExecutionEvent } from '../src/core/execution.ts'
+import { BoardController, type ControllerDeps, type TaskBoardTransport } from '../src/core/controller.ts'
 import { InMemoryTaskStore } from '../src/core/store.ts'
-import { createTask } from '../src/core/tasks.ts'
+import { createTask, type TaskRecord } from '../src/core/tasks.ts'
+import type { TaskBoardAction, TaskBoardEventPayload, TaskBoardSnapshot } from '../src/protocol.ts'
 
 const NOW = 1_700_000_000_000
 let nextId = 0
@@ -17,51 +18,51 @@ const flush = (): Promise<void> => new Promise(resolve => { setTimeout(resolve, 
 
 /** Controllable sessions face (selection + open). */
 class FakeSessions {
-  current: string | undefined = undefined
+  opened: string | undefined = undefined
   openCalls: string[] = []
   private listeners = new Set<() => void>()
-  list = {
-    getSnapshot: (): { current: string | undefined } => ({ current: this.current }),
-    subscribe: (fn: () => void): (() => void) => {
-      this.listeners.add(fn)
-      return () => { this.listeners.delete(fn) }
-    },
+  current(): string | undefined { return this.opened }
+  subscribe(fn: () => void): () => void {
+    this.listeners.add(fn)
+    return () => { this.listeners.delete(fn) }
   }
   open(id: string): void {
     this.openCalls.push(id)
     this.setCurrent(id)
   }
   setCurrent(id: string | undefined): void {
-    this.current = id
+    this.opened = id
     for (const fn of [...this.listeners]) fn()
   }
 }
 
-/** Controllable ExecutionService stub: captures run calls, fires events on demand. */
-class StubExec {
-  runCalls: Array<{ taskId: string; executionId: string; fire: (event: ExecutionEvent) => void }> = []
-  reconcileResult: ExecutionEvent | undefined = undefined
-  async run(task: { id: string }, execution: { id: string }, onEvent: (event: ExecutionEvent) => void): Promise<void> {
-    this.runCalls.push({ taskId: task.id, executionId: execution.id, fire: onEvent })
-  }
-  reconcile(): ExecutionEvent | undefined {
-    return this.reconcileResult
+/** Host-like snapshot builder for transport fakes. */
+function snapshot(revision: number, tasks: TaskRecord[] = [], ledgerId = 'ledger-a'): TaskBoardSnapshot {
+  return {
+    schemaVersion: 7,
+    revision,
+    tasks,
+    scheduler: { timeZone: 'UTC', ledgerId },
+    power: {
+      platform: 'linux', phase: 'unsupported', enabled: false,
+      runningSessions: 0, armedSchedules: 0, sessionStateKnown: true,
+    },
   }
 }
 
-function makeController(stub = new StubExec()) {
+function makeController(panel?: { select(panelId: string | null): void }) {
   const sessions = new FakeSessions()
   const store = new InMemoryTaskStore()
   const deps: ControllerDeps = {
     store,
-    exec: stub as unknown as ExecutionService,
     sessions,
     now: () => NOW,
     uuid,
+    ...(panel === undefined ? {} : { panel }),
   }
   const controller = new BoardController(deps)
   controller.start()
-  return { controller, sessions, store, stub }
+  return { controller, sessions, store }
 }
 
 function seedTask(store: InMemoryTaskStore, overrides: Partial<Parameters<typeof createTask>[0] & { id: string }> = {}) {
@@ -74,16 +75,78 @@ function seedTask(store: InMemoryTaskStore, overrides: Partial<Parameters<typeof
   return task
 }
 
+describe('BoardController execution options', () => {
+  it('starts with empty picker option sets and merges partial updates', () => {
+    const { controller } = makeController()
+    expect(controller.getSnapshot().executionOptions).toEqual({ workspaces: [], presets: [], models: [] })
+    controller.setExecutionOptions({ workspaces: [{ workspaceId: 'ws-1', title: 'One' }] })
+    expect(controller.getSnapshot().executionOptions.workspaces).toEqual([{ workspaceId: 'ws-1', title: 'One' }])
+    expect(controller.getSnapshot().executionOptions.presets).toEqual([])
+    expect(controller.getSnapshot().executionOptions.models).toEqual([])
+    controller.setExecutionOptions({ presets: [{ id: 'anchored', isDefault: true }] })
+    expect(controller.getSnapshot().executionOptions).toEqual({
+      workspaces: [{ workspaceId: 'ws-1', title: 'One' }],
+      presets: [{ id: 'anchored', isDefault: true }],
+      models: [],
+    })
+    controller.setExecutionOptions({ models: [{ id: 'deepseek/deepseek-chat', label: 'DeepSeek Chat' }] })
+    expect(controller.getSnapshot().executionOptions.models).toEqual([
+      { id: 'deepseek/deepseek-chat', label: 'DeepSeek Chat' },
+    ])
+  })
+
+  it('creates tasks carrying execution targets and updates them back', () => {
+    const { controller } = makeController()
+    const task = controller.createTask({
+      title: 'x',
+      description: '',
+      prompt: '',
+      workspaceId: 'ws-1',
+      mode: 'anchored',
+      permission: 'read-only',
+      model: 'deepseek/deepseek-chat',
+    })
+    expect(task?.workspaceId).toBe('ws-1')
+    expect(task?.mode).toBe('anchored')
+    expect(task?.permission).toBe('read-only')
+    expect(task?.model).toBe('deepseek/deepseek-chat')
+    controller.updateTask(task!.id, {
+      workspaceId: undefined,
+      mode: undefined,
+      permission: undefined,
+      model: undefined,
+    })
+    const after = controller.getSnapshot().tasks[0]
+    expect(after.workspaceId).toBeUndefined()
+    expect(after.mode).toBeUndefined()
+    expect(after.permission).toBeUndefined()
+    expect(after.model).toBeUndefined()
+  })
+})
+
 describe('BoardController lifecycle', () => {
   it('loads the persisted ledger on start', () => {
-    const { controller, store } = makeController()
+    const { store } = makeController()
     seedTask(store)
     const reloaded = new BoardController({
-      store, exec: new StubExec() as unknown as ExecutionService,
-      sessions: new FakeSessions(), now: () => NOW, uuid,
+      store, sessions: new FakeSessions(), now: () => NOW, uuid,
     })
     reloaded.start()
     expect(reloaded.getSnapshot().tasks.map(task => task.id)).toEqual(['task-a'])
+  })
+
+  it('reloadFromStore replaces the in-memory ledger from the persisted store, silently', () => {
+    const { controller, store } = makeController()
+    controller.createTask({ title: 'a', description: '', prompt: '' })
+    // A sibling tab deletes the task behind this controller's back (the
+    // persisted store is rewritten); the scheduler-facing reload must pick
+    // the freshest truth up without re-rendering UI subscribers.
+    store.save([])
+    let notified = 0
+    controller.subscribe(() => { notified += 1 })
+    controller.reloadFromStore()
+    expect(controller.getSnapshot().tasks).toEqual([])
+    expect(notified).toBe(0)
   })
 
   it('dispose unsubscribes (no more notifications)', () => {
@@ -104,6 +167,19 @@ describe('task mutations', () => {
     expect(controller.getSnapshot().tasks).toHaveLength(1)
     expect(store.load()[0].title).toBe('新任务')
     expect(controller.createTask({ title: '   ', description: '', prompt: '' })).toBeUndefined()
+  })
+
+  it('uses the default uuid path to mint UUIDv4 task ids', () => {
+    const controller = new BoardController({
+      store: new InMemoryTaskStore(),
+      sessions: new FakeSessions(),
+      now: () => NOW,
+    })
+    controller.start()
+    const task = controller.createTask({ title: 'x', description: '', prompt: '' })!
+    expect(task.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+    // crypto.randomUUID is available under node, so the result is provider-agnostic.
+    expect(task.id).not.toMatch(/^t-/)
   })
 
   it('deletes and clears the selection when the selected task is removed', () => {
@@ -141,21 +217,99 @@ describe('view state', () => {
     expect(controller.getSnapshot().boardOpen).toBe(true)
   })
 
-  it('closes the board when the user navigates to a session', () => {
+  it('operator sees the layout select the board panel on open and the conversation on close', () => {
+    // Given a controller wired to the layout panel-navigation face
+    const selections: Array<string | null> = []
+    const { controller } = makeController({ select: panelId => { selections.push(panelId) } })
+
+    // When the user opens and closes the board
+    controller.openBoard()
+    controller.closeBoard()
+    // Re-opening is not a second selection request for the already-open board
+    controller.openBoard()
+
+    // Then the layout was asked for the board panel, then the conversation,
+    // then the board again
+    expect(selections).toEqual(['task-board', null, 'task-board'])
+  })
+
+  it('operator reopening an open board sees no second panel selection (#1233)', () => {
+    // Given an already-open board
+    const selections: Array<string | null> = []
+    const { controller } = makeController({ select: panelId => { selections.push(panelId) } })
+    controller.openBoard()
+
+    // When openBoard runs again
+    controller.openBoard()
+
+    // Then the layout is not asked to re-select the same panel
+    expect(selections).toEqual(['task-board'])
+  })
+
+  it('operator keeps the board open when the layout face throws before its root entry mounts', () => {
+    // Given a layout service that throws by contract during boot
+    const { controller } = makeController({
+      select: () => { throw new Error('layout root entry has not mounted') },
+    })
+
+    // When the board opens
+    // Then the local state still flips; the throw never reaches the caller
+    expect(() => { controller.openBoard() }).not.toThrow()
+    expect(controller.getSnapshot().boardOpen).toBe(true)
+  })
+
+  it('operator clicking another panel row sees the board follow without asking the layout back', () => {
+    // Given an open board whose layout face records any request
+    const selections: Array<string | null> = []
+    const { controller } = makeController({ select: panelId => { selections.push(panelId) } })
+    controller.openBoard()
+    selections.length = 0
+
+    // When the user clicks another sidebar panel row (the layout owns selection)
+    controller.syncPanelSelection('plugins')
+
+    // Then the board's own view state follows, with no write back to the layout
+    expect(controller.getSnapshot().boardOpen).toBe(false)
+    expect(selections).toEqual([])
+  })
+
+  it('stays open when the current selection changes without user navigation', () => {
     const { controller, sessions } = makeController()
     sessions.setCurrent('s-1')
     controller.openBoard()
     expect(controller.getSnapshot().boardOpen).toBe(true)
+    // The Host runner selecting a fresh execution session is session-list
+    // churn, not user navigation: the board must stay open.
     sessions.setCurrent('s-2')
-    expect(controller.getSnapshot().boardOpen).toBe(false)
+    expect(controller.getSnapshot().boardOpen).toBe(true)
   })
 
-  it('closes the board when a new session is started (selection cleared)', () => {
+  it('stays open during transient undefined session list jitter (#1182)', () => {
     const { controller, sessions } = makeController()
     sessions.setCurrent('s-1')
     controller.openBoard()
+    // Transient undefined blip (e.g. list refresh / subagent chain reload) must not close the board
     sessions.setCurrent(undefined)
-    expect(controller.getSnapshot().boardOpen).toBe(false)
+    expect(controller.getSnapshot().boardOpen).toBe(true)
+    // Resolving back to the current session stays open
+    sessions.setCurrent('s-1')
+    expect(controller.getSnapshot().boardOpen).toBe(true)
+    // Any further selection change is churn as well, not user navigation
+    sessions.setCurrent('s-2')
+    expect(controller.getSnapshot().boardOpen).toBe(true)
+  })
+
+  it('stays open when opened before any session is selected (#1182)', () => {
+    const { controller, sessions } = makeController()
+    sessions.setCurrent(undefined)
+    controller.openBoard()
+    expect(controller.getSnapshot().boardOpen).toBe(true)
+    // First session selection is churn, not navigation: stay open
+    sessions.setCurrent('s-1')
+    expect(controller.getSnapshot().boardOpen).toBe(true)
+    // And so is any later selection change
+    sessions.setCurrent('s-2')
+    expect(controller.getSnapshot().boardOpen).toBe(true)
   })
 
   it('stays open on unrelated session-list changes (status updates of the same selection)', () => {
@@ -184,139 +338,146 @@ describe('view state', () => {
 })
 
 describe('run loop', () => {
-  it('moves to running, attaches the session id, and settles on completion', async () => {
-    const stub = new StubExec()
-    const { controller, store, stub: exec } = makeController(stub)
-    const task = controller.createTask({ title: '任务A', description: '', prompt: '干活' })!
-    const taskId = task.id
-
-    await controller.runTask(taskId)
-    expect(exec.runCalls).toHaveLength(1)
-    expect(exec.runCalls[0].taskId).toBe(taskId)
-    const executionId = exec.runCalls[0].executionId
-    expect(store.load()[0].status).toBe('running')
-
-    // The execution service reports the session…
-    exec.runCalls[0].fire({ kind: 'started', taskId, executionId, sessionId: 's-9' })
-    expect(store.load()[0].executions[0].sessionId).toBe('s-9')
-    expect(store.load()[0].status).toBe('running')
-
-    // A second run call while running is ignored.
-    await controller.runTask(taskId)
-    expect(exec.runCalls).toHaveLength(1)
-
-    // …and settles it.
-    exec.runCalls[0].fire({ kind: 'settled', taskId, executionId, outcome: 'succeeded' })
-    expect(store.load()[0].status).toBe('done')
-    expect(store.load()[0].executions[0].result).toBe('succeeded')
-  })
-
-  it('settles failed tasks into the failed column', async () => {
-    const stub = new StubExec()
-    const { controller, store, stub: exec } = makeController(stub)
-    const task = controller.createTask({ title: '任务A', description: '', prompt: '干活' })!
-    await controller.runTask(task.id)
-    exec.runCalls[0].fire({ kind: 'settled', taskId: task.id, executionId: exec.runCalls[0].executionId, outcome: 'failed', error: 'boom' })
-    expect(store.load()[0].status).toBe('failed')
-    expect(store.load()[0].executions[0].error).toBe('boom')
-  })
-
-  it('rerunTask re-plans a settled task to todo before running again', async () => {
-    const stub = new StubExec()
-    const { controller, stub: exec } = makeController(stub)
-    const task = controller.createTask({ title: '任务A', description: '', prompt: '干活' })!
-    await controller.runTask(task.id)
-    exec.runCalls[0].fire({ kind: 'settled', taskId: task.id, executionId: exec.runCalls[0].executionId, outcome: 'failed' })
-    expect(controller.getSnapshot().tasks[0].status).toBe('failed')
-    await controller.rerunTask(task.id)
-    expect(controller.getSnapshot().tasks[0].status).toBe('running')
-    expect(exec.runCalls).toHaveLength(2)
-  })
-
-  it('reconciles running tasks left over from a previous load', async () => {
-    const stub = new StubExec()
-    stub.reconcileResult = { kind: 'settled', taskId: 'task-a', executionId: 'e1', outcome: 'cancelled', error: 'gone' }
-    const { controller, store } = makeController(stub)
-    const task = seedTask(store, { id: 'task-a' })
-    store.save([{ ...task, status: 'running', executions: [{ id: 'e1', sessionId: 's-1', startedAt: NOW, endedAt: undefined, result: undefined, error: undefined }] }])
-    const reloaded = new BoardController({
-      store, exec: stub as unknown as ExecutionService,
-      sessions: new FakeSessions(), now: () => NOW, uuid,
-    })
-    reloaded.start()
-    await flush()
-    expect(reloaded.getSnapshot().tasks[0].status).toBe('todo')
-  })
-
-  it('settles an orphaned running execution on the next session-list change', async () => {
-    const stub = new StubExec()
-    stub.reconcileResult = { kind: 'settled', taskId: 'task-a', executionId: 'e1', outcome: 'cancelled', error: 'gone' }
-    const store = new InMemoryTaskStore()
-    const task = seedTask(store, { id: 'task-a' })
-    store.save([{ ...task, status: 'running', executions: [{ id: 'e1', sessionId: 's-1', startedAt: NOW, endedAt: undefined, result: undefined, error: undefined }] }])
-    const sessions = new FakeSessions()
-    const controller = new BoardController({
-      store, exec: stub as unknown as ExecutionService,
-      sessions, now: () => NOW, uuid, reconcileDebounceMs: 0,
-    })
-    // Start resolves while the exec still reports nothing to settle…
-    stub.reconcileResult = undefined
-    controller.start()
-    await flush()
-    expect(controller.getSnapshot().tasks[0].status).toBe('running')
-    // …then a later list change settles the orphan without a page reload.
-    stub.reconcileResult = { kind: 'settled', taskId: 'task-a', executionId: 'e1', outcome: 'cancelled', error: 'gone' }
-    sessions.setCurrent('s-new')
-    await flush()
-    await flush()
-    expect(controller.getSnapshot().tasks[0].status).toBe('todo')
-  })
-
-  it('coalesces a burst of session-list changes into one reconcile pass', async () => {
-    let reconcileCalls = 0
-    const stub = {
-      runCalls: [],
-      run: async () => {},
-      reconcile: () => { reconcileCalls += 1; return undefined },
+  it('requests a Host run and applies the confirmed running state', async () => {
+    const initial = createTask({ title: '任务A', description: '', prompt: '干活' }, NOW, 'task-a')
+    const running = {
+      ...initial,
+      status: 'running' as const,
+      updatedAt: NOW + 1,
+      executions: [{
+        id: 'e-open', sessionId: undefined, startedAt: NOW, endedAt: undefined, result: undefined, error: undefined,
+      }],
     }
-    const store = new InMemoryTaskStore()
-    const task = seedTask(store, { id: 'task-a' })
-    store.save([{ ...task, status: 'running', executions: [{ id: 'e1', sessionId: 's-1', startedAt: NOW, endedAt: undefined, result: undefined, error: undefined }] }])
-    const sessions = new FakeSessions()
-    const controller = new BoardController({
-      store, exec: stub as unknown as ExecutionService,
-      sessions, now: () => NOW, uuid, reconcileDebounceMs: 20,
-    })
+    const actions: TaskBoardAction[] = []
+    const transport: TaskBoardTransport = {
+      bootstrap: async () => snapshot(1, [initial]),
+      state: async () => snapshot(1, [initial]),
+      action: async action => { actions.push(action); return snapshot(2, [running]) },
+      subscribe: () => () => undefined,
+    }
+    const controller = new BoardController({ store: new InMemoryTaskStore(), sessions: new FakeSessions(), transport, now: () => NOW, uuid })
     controller.start()
-    await flush()
-    const before = reconcileCalls
-    for (let i = 0; i < 5; i += 1) sessions.setCurrent('s-' + i)
-    await new Promise(resolve => { setTimeout(resolve, 50) })
-    expect(reconcileCalls - before).toBe(1)
+    await controller.retryHostSync()
+
+    expect(await controller.runTask('task-a')).toBe(true)
+    expect(actions).toEqual([{ kind: 'run', taskId: 'task-a' }])
+    expect(controller.getSnapshot().tasks[0].status).toBe('running')
+    // A second run while the task is already running is ignored locally.
+    expect(await controller.runTask('task-a')).toBe(false)
+    expect(actions).toHaveLength(1)
+    controller.dispose()
   })
 
-  it('keeps a page-launched run running on list updates; only the watch settles it', async () => {
-    const stub = new StubExec()
-    const { controller, sessions, store, stub: exec } = makeController(stub)
-    const task = controller.createTask({ title: 'x', description: '', prompt: '' })!
-    // Start a run; attach its session id.
-    await controller.runTask(task.id)
-    const executionId = exec.runCalls[0].executionId
-    exec.runCalls[0].fire({ kind: 'started', taskId: task.id, executionId, sessionId: 's-1' })
-    expect(store.load()[0].status).toBe('running')
+  it('operator runs a card parked in the running column by hand', async () => {
+    // Given a card parked in the running column with no execution behind it
+    const initial = createTask({ title: '任务A', description: '', prompt: '干活' }, NOW, 'task-a')
+    const parked = { ...initial, status: 'running' as const, updatedAt: NOW + 1 }
+    const actions: TaskBoardAction[] = []
+    const transport: TaskBoardTransport = {
+      bootstrap: async () => snapshot(1, [parked]),
+      state: async () => snapshot(1, [parked]),
+      action: async action => { actions.push(action); return snapshot(2, [parked]) },
+      subscribe: () => () => undefined,
+    }
+    const controller = new BoardController({ store: new InMemoryTaskStore(), sessions: new FakeSessions(), transport, now: () => NOW, uuid })
+    controller.start()
+    await controller.retryHostSync()
 
-    // A session-list notification (the executing session appearing in the
-    // list while its turn has not started yet) must NOT settle the run via
-    // reconciliation: a freshly created session is idle, not completed.
-    stub.reconcileResult = { kind: 'settled', taskId: task.id, executionId, outcome: 'succeeded' }
-    sessions.setCurrent('s-2')
+    // When the operator asks for a run
+    // Then the Host request goes out: only an open execution blocks a launch
+    expect(await controller.runTask('task-a')).toBe(true)
+    expect(actions).toEqual([{ kind: 'run', taskId: 'task-a' }])
+    controller.dispose()
+  })
+
+  it('applies Host settlement through an SSE frame', async () => {
+    const initial = createTask({ title: '任务A', description: '', prompt: '干活' }, NOW, 'task-a')
+    const running: TaskRecord = {
+      ...initial, status: 'running', updatedAt: NOW + 1,
+      executions: [{ id: 'e1', sessionId: 's-9', startedAt: NOW, endedAt: undefined, result: undefined, error: undefined }],
+    }
+    const done: TaskRecord = {
+      ...running, status: 'done', updatedAt: NOW + 2,
+      executions: [{ id: 'e1', sessionId: 's-9', startedAt: NOW, endedAt: NOW + 5, result: 'succeeded', error: undefined }],
+    }
+    let onEvent: ((event?: TaskBoardEventPayload) => void) | undefined
+    let remote = snapshot(2, [running])
+    const transport: TaskBoardTransport = {
+      bootstrap: async () => snapshot(1, [initial]),
+      state: async () => remote,
+      action: async () => { remote = snapshot(2, [running]); return remote },
+      subscribe: listener => { onEvent = listener; return () => undefined },
+    }
+    const controller = new BoardController({ store: new InMemoryTaskStore(), sessions: new FakeSessions(), transport, now: () => NOW, uuid })
+    controller.start()
+    await controller.retryHostSync()
+    await controller.runTask('task-a')
+    expect(controller.getSnapshot().tasks[0].status).toBe('running')
+
+    // The Host settles the execution and broadcasts the frame.
+    remote = snapshot(3, [done])
+    onEvent?.({ revision: 3, scheduler: { timeZone: 'UTC', ledgerId: 'ledger-a' }, power: snapshot(3).power })
     await flush()
-    expect(store.load()[0].status).toBe('running')
+    expect(controller.getSnapshot().tasks[0].status).toBe('done')
+    expect(controller.getSnapshot().tasks[0].executions[0].result).toBe('succeeded')
+    controller.dispose()
+  })
 
-    // The live watch settles on the turn boundary.
-    exec.runCalls[0].fire({ kind: 'settled', taskId: task.id, executionId, outcome: 'succeeded' })
-    expect(store.load()[0].status).toBe('done')
-    expect(store.load()[0].executions[0].result).toBe('succeeded')
+  it('rerunTask requests a Host rerun and applies the replanned running state', async () => {
+    const initial = createTask({ title: '任务A', description: '', prompt: '干活' }, NOW, 'task-a')
+    const failed: TaskRecord = {
+      ...initial, status: 'failed', updatedAt: NOW + 1,
+      executions: [{ id: 'e1', sessionId: 's-9', startedAt: NOW, endedAt: NOW + 5, result: 'failed', error: 'boom' }],
+    }
+    const rerunning: TaskRecord = { ...failed, status: 'running', updatedAt: NOW + 2 }
+    const actions: TaskBoardAction[] = []
+    const transport: TaskBoardTransport = {
+      bootstrap: async () => snapshot(2, [failed]),
+      state: async () => snapshot(2, [failed]),
+      action: async action => { actions.push(action); return snapshot(3, [rerunning]) },
+      subscribe: () => () => undefined,
+    }
+    const controller = new BoardController({ store: new InMemoryTaskStore(), sessions: new FakeSessions(), transport, now: () => NOW, uuid })
+    controller.start()
+    await controller.retryHostSync()
+
+    expect(controller.getSnapshot().tasks[0].status).toBe('failed')
+    await controller.rerunTask('task-a')
+    expect(actions).toEqual([{ kind: 'rerun', taskId: 'task-a' }])
+    expect(controller.getSnapshot().tasks[0].status).toBe('running')
+    controller.dispose()
+  })
+
+  it('refuses runs and reruns of archived tasks without contacting the Host', async () => {
+    const archived = {
+      ...createTask({ title: '归档任务', description: '', prompt: '干活' }, NOW, 'task-a'),
+      status: 'done' as const,
+      archivedAt: NOW,
+    }
+    const action = vi.fn(async () => snapshot(1, [archived]))
+    const transport: TaskBoardTransport = {
+      bootstrap: async () => snapshot(1, [archived]),
+      state: async () => snapshot(1, [archived]),
+      action,
+      subscribe: () => () => undefined,
+    }
+    const controller = new BoardController({ store: new InMemoryTaskStore(), sessions: new FakeSessions(), transport, now: () => NOW, uuid })
+    controller.start()
+    await controller.retryHostSync()
+
+    expect(await controller.runTask('task-a')).toBe(false)
+    await controller.rerunTask('task-a')
+    expect(action).not.toHaveBeenCalled()
+    expect(controller.getSnapshot().tasks[0]).toMatchObject({ status: 'done', archivedAt: NOW })
+    controller.dispose()
+  })
+
+  it('refuses to run without a Host transport (legacy client execution removed)', async () => {
+    const { controller } = makeController()
+    const task = controller.createTask({ title: 'x', description: '', prompt: '' })!
+    expect(await controller.runTask(task.id)).toBe(false)
+    await controller.rerunTask(task.id)
+    expect(controller.getSnapshot().tasks[0].status).toBe('todo')
   })
 })
 
@@ -329,6 +490,16 @@ describe('scheduling', () => {
     expect(persisted.schedule?.enabled).toBe(true)
     expect(persisted.schedule?.cron).toBe('* * * * *')
     expect(persisted.schedule?.nextRunAt).toBeDefined()
+  })
+
+  it('does not let archived tasks re-enable their schedules', () => {
+    const { controller, store } = makeController()
+    const task = controller.createTask({ title: 'x', description: '', prompt: '' })!
+    expect(controller.setSchedule(task.id, { enabled: true, cron: '* * * * *' })).toBe(true)
+    controller.moveTask(task.id, 'done')
+    expect(controller.archiveTask(task.id)).toBe(true)
+    expect(store.load()[0].schedule).toMatchObject({ enabled: false, nextRunAt: undefined })
+    expect(controller.setSchedule(task.id, { enabled: true, cron: '* * * * *' })).toBe(false)
   })
 
   it('rejects blank or invalid cron expressions without touching state', () => {
@@ -377,5 +548,105 @@ describe('scheduling', () => {
     const task = controller.createTask({ title: 'x', description: '', prompt: '' })!
     expect(() => controller.applyScheduleNextRun(task.id, 1, 2)).not.toThrow()
     expect(controller.getSnapshot().tasks[0].schedule).toBeUndefined()
+  })
+})
+
+describe('legacy parent links', () => {
+  it('user linking a task to a parent through the in-memory controller stores the link and can detach it', async () => {
+    // Given two stored tasks and a controller without a Host transport
+    const { controller, store } = makeController()
+    store.save([
+      createTask({ title: 'Root', description: '', prompt: 'root' }, NOW, 'root'),
+      createTask({ title: 'Free', description: '', prompt: 'free' }, NOW, 'free'),
+    ])
+    controller.reloadFromStore()
+
+    // When the user links the free task under the root
+    const applied = await controller.setParent('free', 'root')
+
+    // Then the link is stored and visible in the snapshot
+    expect(applied).toBe(true)
+    expect(controller.getSnapshot().tasks.find(entry => entry.id === 'free')?.parentId).toBe('root')
+
+    // When the user detaches it again
+    await controller.setParent('free', null)
+
+    // Then the task is a root once more
+    expect(controller.getSnapshot().tasks.find(entry => entry.id === 'free')?.parentId).toBeUndefined()
+  })
+
+  it('user linking a task under a subtask is refused by the in-memory controller at the default depth', async () => {
+    // Given a root with a subtask and one free task
+    const { controller, store } = makeController()
+    store.save([
+      createTask({ title: 'Root', description: '', prompt: 'root' }, NOW, 'root'),
+      createTask({ title: 'Child', description: '', prompt: 'child', parentId: 'root' }, NOW, 'child'),
+      createTask({ title: 'Free', description: '', prompt: 'free' }, NOW, 'free'),
+    ])
+    controller.reloadFromStore()
+
+    // When the user tries to attach the free task under the subtask
+    const applied = await controller.setParent('free', 'child')
+
+    // Then the refusal leaves the task a root
+    expect(applied).toBe(false)
+    expect(controller.getSnapshot().tasks.find(entry => entry.id === 'free')?.parentId).toBeUndefined()
+  })
+})
+
+/** Store that can simulate a sibling tab writing the ledger. */
+class ExternalAwareStore extends InMemoryTaskStore {
+  listeners = new Set<() => void>()
+  subscribeExternal(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+  /** Simulate another tab persisting a new ledger document. */
+  writeFromElsewhere(tasks: readonly TaskRecord[]): void {
+    this.save(tasks)
+    for (const listener of [...this.listeners]) listener()
+  }
+}
+
+describe('external (cross-tab) ledger changes', () => {
+  function makeWithExternalStore() {
+    const sessions = new FakeSessions()
+    const store = new ExternalAwareStore()
+    const controller = new BoardController({
+      store,
+      sessions,
+      now: () => NOW,
+      uuid,
+    })
+    controller.start()
+    return { controller, sessions, store }
+  }
+
+  it('reloads the ledger when a sibling tab deletes a task', () => {
+    const { controller, store } = makeWithExternalStore()
+    const task = controller.createTask({ title: 'x', description: '', prompt: '' })!
+    expect(controller.getSnapshot().tasks.map(t => t.id)).toEqual([task.id])
+    // Another tab deletes the task and persists; this tab must drop it too,
+    // so its scheduler can never fire (or write back) the deleted task.
+    store.writeFromElsewhere([])
+    expect(controller.getSnapshot().tasks).toHaveLength(0)
+    expect(store.load()).toEqual([])
+  })
+
+  it('reloads a task created in a sibling tab', () => {
+    const { controller, store } = makeWithExternalStore()
+    expect(controller.getSnapshot().tasks).toHaveLength(0)
+    const task = createTask({ title: '从别的标签页创建', description: '', prompt: '' }, NOW, 'other-tab')
+    store.writeFromElsewhere([task])
+    expect(controller.getSnapshot().tasks.map(t => t.id)).toEqual(['other-tab'])
+  })
+
+  it('stops reacting to external changes after dispose', () => {
+    const { controller, store } = makeWithExternalStore()
+    let notified = 0
+    controller.subscribe(() => { notified += 1 })
+    controller.dispose()
+    store.writeFromElsewhere([])
+    expect(notified).toBe(0)
   })
 })

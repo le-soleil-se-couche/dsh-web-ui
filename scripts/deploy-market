@@ -1,0 +1,458 @@
+#!/usr/bin/env node
+'use strict'
+
+/**
+ * deploy-market — deploy the dsh-market.com Worker static site and apply D1
+ * migrations.
+ *
+ * Pipeline of this script:
+ *   1. sanity: market-build --check (committed dist is up to date)
+ *   2. cf d1 migrations apply <database id> --dir migrations (idempotent)
+ *   3. cf deploy (worker + static assets; the custom domains stay
+ *      dashboard-managed and are declared nowhere)
+ *   4. ensure the worker actually has a TURNSTILE_SECRET binding (refreshing
+ *      it from the deploy environment when present) — likes/installs fail
+ *      closed without it, so a missing secret fails the deploy loudly
+ *   5. ensure the ASSET_ATTEST_SECRET binding is there for the attestation route
+ *
+ * Auth: cf uses its own login/CI env (CLOUDFLARE_API_TOKEN,
+ * CLOUDFLARE_ACCOUNT_ID).
+ *
+ * Retries: the Workers API throttles with a 429 that carries no Retry-After
+ * header, and the CLI only backs off when that header is present, so one
+ * throttled response used to end the deploy lane. Every cf invocation now
+ * retries the transient conditions (HTTP 429, HTTP 5xx in the shapes the CLI
+ * prints them in, an API response body that is not JSON - cf reports that one
+ * with the status it arrived with - and socket-level errors) up to MAX_ATTEMPTS
+ * runs with the RETRY_BACKOFF_MS pauses between them. Every other failure — a
+ * bad config, a rejected token, a missing binding, a non-transient D1 migration
+ * error — still fails on the first attempt, because retrying those only spends
+ * three more minutes reaching the same red lane.
+ *
+ * Usage:
+ *   node scripts/deploy-market --cf "npx cf@latest"  # custom cf cmd
+ */
+
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { spawn, spawnSync } = require('node:child_process')
+
+const ROOT = path.resolve(__dirname, '..')
+const WORKER_DIR = path.join(ROOT, 'market', 'worker')
+const WORKER_NAME = 'dsh-market'
+/** cf takes the D1 database ID here, not the database name or the binding name. */
+const D1_DATABASE_ID = '95f4e8ae-444a-46d0-98be-c367a9dbe6e8'
+
+/** Runs per cf invocation: the first attempt plus at most three retries. */
+const MAX_ATTEMPTS = 4
+
+/** Pause before retry N+1 in milliseconds, so index 0 is the pause after attempt 1. */
+const RETRY_BACKOFF_MS = [5000, 20000, 60000]
+
+/** Lines of child output kept for classification and for the failure evidence. */
+const TAIL_LINES = 200
+
+function opt(name, fallback) {
+  const i = process.argv.indexOf(name)
+  return i >= 0 && process.argv[i + 1] !== undefined ? process.argv[i + 1] : fallback
+}
+const cfCmd = opt('--cf', 'cf')
+
+function fail(msg) {
+  console.error('deploy-market: ' + msg)
+  process.exit(1)
+}
+
+/**
+ * Signatures of a failure that is worth another attempt, in reason precedence
+ * order. The incident that motivated the retry carried both the unparsable
+ * response body and the 429 status, so the earlier entry names the reason.
+ */
+const TRANSIENT_SIGNATURES = [
+  // A bare 429 in the failure output is the HTTP status: the API error is
+  // printed as "GET <path> -> 429 Too Many Requests" (wrangler) or as
+  // "429 Too Many Requests - HTTP <path>" / "Status code: 429" (cf), and
+  // neither shape carries a Retry-After header.
+  { reason: 'http-429', re: /\b429\b/ },
+  // Status codes are read from the shapes the CLI prints them in ("-> 503",
+  // "HTTP 522", "statusCode: 500", "Status code: 503") so an unrelated 500 in a
+  // stack trace or a file size cannot pass for a server-side outage.
+  { reason: 'http-5xx', re: /(?:\bHTTP(?:\/[\d.]+)?|\bstatus(?:\s*code)?\s*[:=]?|->)\s*\[?\s*5\d{2}\b/i },
+  // cf renders a typed Workers command failure as "<status> <text> · HTTP
+  // <path>" (measured on a real throttle: "429 Too Many Requests · HTTP
+  // /accounts/.../workers/scripts/dsh-market/secrets"). That line carries the
+  // status in no other shape - no "HTTP 5xx" and no "Status code:" marker - so
+  // the branch above misses it; this one anchors on cf's separator instead,
+  // which keeps a size or a count that merely reads "500" out of the match.
+  // The status text comes from a fixed table, so a code that table does not map
+  // (520-527 and friends) renders with an empty text and no trim - "522  · HTTP
+  // /accounts/.../d1/..." - which the second alternative covers; 522 is the code
+  // this repository has an incident on record for.
+  { reason: 'http-5xx', re: /\b5\d{2}\s+[A-Za-z][A-Za-z ]*\s+·\s+HTTP\b|\b5\d{2}\s+·\s*HTTP\b/ },
+  // A response body the CLI cannot parse as JSON. The matched phrase is
+  // wrangler's wording for that condition, kept for the historical incident;
+  // cf reports the same condition as a non-json body and prints the status it
+  // came with, which an earlier entry matches.
+  { reason: 'malformed-api-response', re: /malformed response from the API/i },
+  { reason: 'socket-error', re: /\b(?:ECONNRESET|ETIMEDOUT|EPIPE)\b|socket hang up/i },
+  // The same condition in Node's own network-layer wording, which is what cf
+  // prints today: undici rejects a connection it could not complete with a
+  // TypeError whose message is exactly "fetch failed", and cf's error box
+  // prints that message alone — the cause naming the syscall (ECONNRESET,
+  // ENOTFOUND, UND_ERR_*) reaches the log only when cf runs with DEBUG. A
+  // node-fetch based client prints the identical failure as "FetchError:
+  // request to <url> failed, reason: ...". Neither token appears in a config,
+  // auth, content or migration failure, so this stays a network-layer match
+  // beside the wrangler socket wording above.
+  { reason: 'socket-error', re: /\bfetch failed\b|\bFetchError\b/i },
+]
+
+/** Transient reason for a failure text, or null when it must fail fast. */
+function classifyTransientFailure(text) {
+  const haystack = String(text || '')
+  for (const { reason, re } of TRANSIENT_SIGNATURES) {
+    if (re.test(haystack)) return reason
+  }
+  return null
+}
+
+/** Pause before the next attempt after failedAttempt (1-based), or null when none remains. */
+function retryDelayMs(failedAttempt) {
+  const pause = RETRY_BACKOFF_MS[failedAttempt - 1]
+  return pause === undefined ? null : pause
+}
+
+/**
+ * Bounded line ring for one child run. The child's output is forwarded to the
+ * job log as it arrives, while only the last TAIL_LINES lines are kept — enough
+ * to classify the failure and to quote evidence without holding a whole deploy
+ * log in memory.
+ */
+function createTail(limit = TAIL_LINES) {
+  const lines = []
+  let pending = ''
+  const push = (line) => {
+    lines.push(line)
+    if (lines.length > limit) lines.shift()
+  }
+  return {
+    chunk(text) {
+      pending += text
+      const parts = pending.split('\n')
+      pending = parts.pop()
+      for (const line of parts) push(line)
+    },
+    flush() {
+      if (pending !== '') push(pending)
+      pending = ''
+      return lines.join('\n')
+    },
+  }
+}
+
+/** Cloudflare's per-response Ray ID, the handle support asks for. */
+const RAY_ID_PATTERNS = [
+  /\bRay ID:?\s*`?([0-9a-f]{12,20})/i,
+  /"ray_id"\s*:\s*"([0-9a-f-]{12,40})"/i,
+  /\bcf-ray:\s*([0-9a-f-]{12,40})/i,
+]
+
+/** Ray ID carried by a failure text, or null when Cloudflare printed none. */
+function rayIdFrom(text) {
+  const haystack = String(text || '')
+  for (const re of RAY_ID_PATTERNS) {
+    const match = re.exec(haystack)
+    if (match) return match[1]
+  }
+  return null
+}
+
+/**
+ * One child run: stdout and stderr are piped so each chunk reaches the job log
+ * the moment the child writes it, and the tail is what later classifies the
+ * failure. Capture mode stays silent (it only feeds the secret-list check) and
+ * keeps the whole output for parsing.
+ */
+function spawnAttempt(cmd, args, env, opts) {
+  const options = opts || {}
+  const capture = Boolean(options.capture)
+  return new Promise((resolve) => {
+    const tail = createTail()
+    const captured = []
+    let settled = false
+    const settle = (status) => {
+      if (settled) return
+      settled = true
+      resolve({ status, output: captured.join(''), tail: tail.flush() })
+    }
+    const child = spawn(cmd, args, {
+      cwd: WORKER_DIR,
+      env: Object.assign({}, process.env, env || {}),
+      stdio: ['inherit', 'pipe', 'pipe'],
+    })
+    const relay = (stream) => (buf) => {
+      const text = String(buf)
+      tail.chunk(text)
+      if (capture) captured.push(text)
+      else stream.write(text)
+    }
+    child.stdout.on('data', relay(process.stdout))
+    child.stderr.on('data', relay(process.stderr))
+    child.on('error', (err) => {
+      const text = 'deploy-market: cannot run ' + cmd + ': ' + (err && err.message ? err.message : String(err))
+      tail.chunk(text + '\n')
+      if (capture) captured.push(text + '\n')
+      else process.stderr.write(text + '\n')
+      // No exit status: reported as "exit null" exactly as the previous
+      // spawnSync-based runner did, and never retried.
+      settle(null)
+    })
+    child.on('close', (code) => settle(code))
+  })
+}
+
+/**
+ * Run one command under the retry policy. runAttempt performs a single child
+ * run and wait pauses between attempts; both are injected so the policy is
+ * driveable in tests without a child process or a real clock.
+ */
+async function runWithRetries(runAttempt, options) {
+  const settings = options || {}
+  const attempts = settings.attempts === undefined ? MAX_ATTEMPTS : settings.attempts
+  const wait = settings.wait || waitMs
+  const onRetry = settings.onRetry || (() => {})
+  let last = null
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const result = await runAttempt(attempt)
+    // The whole captured output rides back on success, not just the tail: the
+    // binding check parses it (`secretNames()` reads `output`), and the tail is a
+    // bounded evidence buffer that cannot stand in for it. The failure paths below
+    // deliberately keep only the tail -- nothing parses a failed run, and the bound
+    // is what keeps a whole deploy log out of memory.
+    if (result.status === 0) return { ok: true, status: 0, attempts: attempt, output: result.output, tail: result.tail }
+    const tail = result.tail || ''
+    last = { status: result.status, attempts: attempt, reason: classifyTransientFailure(tail), tail }
+    // Only a transient failure earns another attempt, and only while the
+    // budget still has one: everything else keeps the fail-fast path.
+    if (!last.reason) return { ok: false, status: last.status, attempts: last.attempts, reason: null, tail }
+    const pauseMs = last.attempts < attempts ? retryDelayMs(last.attempts) : null
+    if (pauseMs === null) break
+    onRetry({ attempt: last.attempts, attempts, reason: last.reason, pauseMs })
+    await wait(pauseMs)
+  }
+  return { ok: false, status: last.status, attempts, reason: last.reason, tail: last.tail }
+}
+
+const waitMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Failure text for the job log. A non-transient failure keeps the message the
+ * lane always printed; an exhausted retry budget adds why it was retried, how
+ * many attempts were spent, the Ray ID when Cloudflare provided one, and the
+ * captured tail so the next incident is diagnosable from the log alone.
+ */
+function failureMessage(cmd, args, result) {
+  const base = cmd + ' ' + args.join(' ') + ' failed (exit ' + result.status + ')'
+  if (!result.reason) return base
+  const lines = [base + ' — still transient (' + result.reason + ') after ' + result.attempts + ' attempts']
+  const rayId = rayIdFrom(result.tail)
+  if (rayId) lines.push('  Ray ID: ' + rayId)
+  lines.push('  captured output tail (at most ' + TAIL_LINES + ' lines):')
+  for (const line of String(result.tail || '').split('\n')) lines.push('  | ' + line)
+  return lines.join('\n')
+}
+
+async function sh(cmd, args, env, opts) {
+  const result = await runWithRetries(() => spawnAttempt(cmd, args, env, opts), {
+    onRetry: ({ attempt, reason, pauseMs }) => {
+      console.log('deploy-market: ' + cmd + ' ' + args.join(' ') + ' hit a transient failure (' + reason +
+        ') on attempt ' + attempt + '/' + MAX_ATTEMPTS + '; retrying in ' + pauseMs + 'ms')
+    },
+  })
+  if (!result.ok) fail(failureMessage(cmd, args, result))
+  return result
+}
+
+const [cmdExec, ...cmdArgs] = cfCmd.split(' ')
+const cf = (args, env, opts) => sh(cmdExec, [...cmdArgs, ...args], env, opts)
+
+/** Temp dirs still holding a secret value for a running child. */
+const secretDirs = new Set()
+
+// fail() ends the process with process.exit, which skips every pending finally
+// block, so the exit hook is what keeps a failed upload from leaving the value
+// on disk; the finally in withSecretFile covers the ordinary paths.
+process.on('exit', () => {
+  for (const dir of secretDirs) fs.rmSync(dir, { recursive: true, force: true })
+})
+
+/**
+ * Stage one secret value in a 0600 file for the child to read. cf takes the
+ * payload as a `--text @path` reference, so the value stays out of the command
+ * line — and therefore out of the failure log, which prints cmd + args — and
+ * out of the child's stdin, whose empty-pipe failure once stored an empty
+ * TURNSTILE_SECRET while the CLI reported Success.
+ */
+async function withSecretFile(value, run) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-market-'))
+  const file = path.join(dir, 'secret')
+  secretDirs.add(dir)
+  try {
+    fs.writeFileSync(file, value, { mode: 0o600 })
+    return await run(file)
+  } finally {
+    secretDirs.delete(dir)
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+/**
+ * Command line of one secret upload; the value travels in the file, not here.
+ * --type is not optional: without it cf refuses the call outright when stdin is
+ * not a TTY — which is every CI run — and never sends the request.
+ */
+function secretUpdateArgs(name, file) {
+  return ['workers', 'secrets', 'update', name, '--worker', WORKER_NAME, '--type', 'secret_text', '--text', '@' + file]
+}
+
+/**
+ * Secret names from `cf workers secrets list`: cf prints JSON, either the API
+ * envelope (result: [{ name }]) or the bare result array. Output that does not
+ * parse, or carries no names, is scanned as text instead, so a change of output
+ * shape cannot turn a present binding into a missing one.
+ */
+function secretNamesFrom(output) {
+  const text = String(output || '')
+  try {
+    const parsed = JSON.parse(text)
+    const rows = Array.isArray(parsed) ? parsed : parsed && parsed.result
+    const names = (Array.isArray(rows) ? rows : [])
+      .map((row) => (typeof row === 'string' ? row : row && row.name))
+      .filter((name) => typeof name === 'string' && name !== '')
+    if (names.length) return names.join('\n')
+  } catch { /* not JSON: the text scan below is the fallback */ }
+  return text
+}
+
+async function secretNames() {
+  const list = await cf(['workers', 'secrets', 'list', '--worker', WORKER_NAME], undefined, { capture: true })
+  return secretNamesFrom(list.output)
+}
+
+/**
+ * A secrets update lands as a new version, and the list answers from the
+ * deployment the CLI can see, so the re-read right after an update can still
+ * report the previous set. Poll that short window instead of failing the deploy
+ * on the race: a binding that is genuinely absent still fails, ten seconds on.
+ */
+async function secretNamesSettled(name) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if ((await secretNames()).includes(name)) return true
+    await waitMs(2000)
+  }
+  return false
+}
+
+// Turnstile fail-closed contract: /api/like and /api/install reject every
+// write when the worker has no TURNSTILE_SECRET, so deploying without the
+// secret silently disables likes/installs. Refresh the binding when the
+// deploy environment carries it, then verify the worker actually has it —
+// a missing secret must fail the deploy loudly, not ship an ungated (old
+// code) or write-dead (new code) production API.
+async function ensureTurnstileSecret() {
+  // Trim before putting: a repo secret pasted with a trailing newline once
+  // shipped a value siteverify rejected (invalid-input-secret) and took the
+  // like/install gate down site-wide while every deploy re-put the same bytes.
+  const secret = (process.env.TURNSTILE_SECRET || '').trim()
+  if (secret) {
+    console.log('deploy-market: refreshing TURNSTILE_SECRET binding')
+    await withSecretFile(secret, (file) => cf(secretUpdateArgs('TURNSTILE_SECRET', file)))
+  }
+  if (!(await secretNamesSettled('TURNSTILE_SECRET'))) {
+    fail('worker has no TURNSTILE_SECRET binding — set it (cf workers secrets update TURNSTILE_SECRET --worker ' + WORKER_NAME + ' --type secret_text --text "<value>") or export TURNSTILE_SECRET before deploying; likes/installs fail closed without it')
+  }
+  assertTurnstilePairing(secret)
+}
+
+// Attestation fail-closed contract: the lane that verifies the deployed assets
+// calls POST /api/asset-attest, which answers 503 without its secret binding,
+// so a deploy that loses the binding leaves the post-deploy verification unable
+// to measure anything. Refresh it when the deploy environment carries it, then
+// verify the binding is there.
+async function ensureAttestSecret() {
+  const secret = (process.env.MARKET_ATTEST_SECRET || '').trim()
+  if (secret) {
+    console.log('deploy-market: refreshing ASSET_ATTEST_SECRET binding')
+    await withSecretFile(secret, (file) => cf(secretUpdateArgs('ASSET_ATTEST_SECRET', file)))
+  }
+  if (!(await secretNamesSettled('ASSET_ATTEST_SECRET'))) {
+    fail('worker has no ASSET_ATTEST_SECRET binding — set it (cf workers secrets update ASSET_ATTEST_SECRET --worker ' + WORKER_NAME + ' --type secret_text --text "<value>") or export MARKET_ATTEST_SECRET before deploying; the attestation route fails closed without it')
+  }
+}
+
+// Probe siteverify with the just-put binding value and a dummy response token.
+// A correctly paired secret answers invalid-input-response; invalid-input-secret
+// means the binding does not match the widget and every like/install would 403.
+function assertTurnstilePairing(secret) {
+  if (!secret) return
+  const probe = spawnSync('curl', [
+    '-s', '-X', 'POST', 'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+    '-d', 'secret=' + secret, '-d', 'response=probe-dummy-token',
+  ], { encoding: 'utf8' })
+  let codes = []
+  try { codes = JSON.parse(probe.stdout || '{}')['error-codes'] || [] } catch { /* unparsable body */ }
+  if (codes.includes('invalid-input-secret')) {
+    fail('TURNSTILE_SECRET does not pair with the dsh-market widget sitekey — likes/installs would 403 site-wide. Read the current secret from GET /accounts/{account}/challenges/widgets/0x4AAAAAAEYeoSRJRjgCOiZI and update the repository secret.')
+  }
+  console.log('deploy-market: Turnstile binding pairing check ' + (codes.length ? 'saw ' + codes.join(',') : 'unavailable (treating as pass)'))
+}
+
+
+async function main() {
+  // 1) 产物一致性（CI 只部署已提交产物）
+  const check = spawnSync('node', [path.join(ROOT, 'scripts', 'market-build'), '--check'], {
+    cwd: ROOT, stdio: 'inherit',
+  })
+  if (check.status !== 0) fail('market-build --check failed — rebuild and commit market/dist first')
+
+  // 2) D1 migration（幂等）
+  await cf(['d1', 'migrations', 'apply', D1_DATABASE_ID, '--dir', 'migrations'])
+
+  // 3) Worker 部署（含静态资产；自定义域名由 dashboard 管理，配置里不声明）
+  await cf(['deploy'])
+
+  // 4) Turnstile 绑定核验（worker 缺绑定时点赞/安装全部 fail closed）
+  await ensureTurnstileSecret()
+
+  // 5) 资产校验密钥绑定核验（缺绑定时部署后校验路由 fail closed，等于没校验）
+  await ensureAttestSecret()
+
+  console.log('deploy-market: done — https://dsh-market.com')
+}
+
+module.exports = {
+  MAX_ATTEMPTS,
+  RETRY_BACKOFF_MS,
+  TAIL_LINES,
+  WORKER_NAME,
+  D1_DATABASE_ID,
+  classifyTransientFailure,
+  createTail,
+  failureMessage,
+  rayIdFrom,
+  retryDelayMs,
+  runWithRetries,
+  secretNamesFrom,
+  secretUpdateArgs,
+  spawnAttempt,
+  withSecretFile,
+}
+
+// Only the CLI entry deploys; requiring this file (the retry tests) must not
+// start a deploy.
+if (require.main === module) {
+  main().catch((err) => {
+    fail(err && err.message ? err.message : String(err))
+  })
+}

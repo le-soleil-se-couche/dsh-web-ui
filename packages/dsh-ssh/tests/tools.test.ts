@@ -5,7 +5,6 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { SshEngine } from '../src/engine.ts'
 import type { ExecResult, SshHostSummary, TunnelInfo } from '../src/protocol.ts'
@@ -87,6 +86,7 @@ const host: SshHostSummary = {
   environment: 'production',
   tags: ['web'],
   location: 'dc-a',
+  forwardAgent: false,
   createdAt: 1,
   updatedAt: 1,
 }
@@ -109,10 +109,71 @@ describe('ssh_list', () => {
     stub.hosts = [host]
     const tool = sshListTool(engine(stub))
     const result = await run(tool, {})
-    expect((result.hosts as SshHostSummary[])).toEqual([host])
+    // The model-facing row never carries the ProxyCommand string itself, only
+    // whether one is configured (it may embed bastion credentials).
+    expect(result.hosts).toEqual([{ ...host, proxyCommandConfigured: false }])
     const text = render(tool, result)
     expect(text).toContain('web-01')
     expect(text).toContain('10.0.0.1')
+    expect(text).toContain('| - |')
+  })
+
+  it('marks a ProxyCommand host and a jump chain in the table', async () => {
+    const stub = new StubEngine()
+    stub.hosts = [
+      { ...host, proxyCommand: 'corp proxy %h %p' },
+      { ...host, alias: 'jump-host', proxyJump: ['bastion'] },
+    ]
+    const tool = sshListTool(engine(stub))
+    const result = await run(tool, {})
+    const rows = result.hosts as Array<Record<string, unknown>>
+    expect(rows[0]?.['proxyCommandConfigured']).toBe(true)
+    expect('proxyCommand' in (rows[0] ?? {})).toBe(false)
+    const text = render(tool, result)
+    expect(text).toContain('proxy-command')
+    expect(text).toContain('jump:bastion')
+  })
+})
+
+describe('ssh_list agent forwarding', () => {
+  it('member listing hosts gets forwardAgent as a required boolean field in the schema', () => {
+    // Given the ssh_list tool and its declared output schema
+    const tool = sshListTool(engine(new StubEngine()))
+    const schema = tool.output.schema as unknown as {
+      properties: { hosts: { items: { properties: Record<string, { type?: string }>; required: string[] } } }
+    }
+
+    // When the per-host row schema is inspected
+    const items = schema.properties.hosts.items
+    const field = items.properties['forwardAgent']
+
+    // Then the field is declared, typed as a boolean and required, so an
+    // undefined value can never reach the tool bridge
+    expect(field).toEqual({ type: 'boolean' })
+    expect(items.required).toContain('forwardAgent')
+  })
+
+  it('member listing a forwarding host sees the flag on the row and a yes cell in the table', async () => {
+    // Given one forwarding host and one host without the opt-in
+    const stub = new StubEngine()
+    stub.hosts = [{ ...host, forwardAgent: true }, { ...host, alias: 'plain-host' }]
+    const tool = sshListTool(engine(stub))
+
+    // When the host list is produced and rendered
+    const result = await run(tool, {})
+    const rows = result.hosts as Array<Record<string, unknown>>
+    const text = render(tool, result)
+
+    // Then the row carries a definite boolean and the table shows a forward
+    // column with the enabled host marked, and the tool advertises the column
+    expect(tool.description).toContain('agent forwarding')
+    expect(rows[0]?.['forwardAgent']).toBe(true)
+    expect(rows[1]?.['forwardAgent']).toBe(false)
+    expect(text).toContain('forward')
+    const plainRow = text.split('\n').find(line => line.startsWith('plain-host '))
+    expect(plainRow?.split(' | ')[6]).toBe('-')
+    const forwardingRow = text.split('\n').find(line => line.startsWith('web-01 '))
+    expect(forwardingRow?.split(' | ')[6]).toBe('yes')
   })
 })
 
@@ -175,3 +236,68 @@ describe('ssh_upload / ssh_download', () => {
     expect(down.bytes).toBe(34)
   })
 })
+
+describe('path-scope guidance for agents (issue #760)', () => {
+  it('ssh_upload draws the local-vs-remote boundary and points local files to local tools', () => {
+    const tool = sshUploadTool(engine(new StubEngine()))
+    const name = tool.description.toLowerCase()
+    expect(name).toContain('from this machine')
+    expect(name).toContain('remote ssh host')
+    expect(name).toContain('local file tools')
+    const lparams = tool.parameters as unknown as { properties: Record<string, { description: string }> }
+    const localPath = lparams.properties.localPath.description.toLowerCase()
+    expect(localPath).toContain('this machine')
+    expect(localPath).toContain('not a path on the remote host')
+    const remotePath = lparams.properties.remotePath.description.toLowerCase()
+    expect(remotePath).toContain('remote ssh host')
+  })
+
+  it('ssh_download draws the same boundary', () => {
+    const tool = sshDownloadTool(engine(new StubEngine()))
+    const name = tool.description.toLowerCase()
+    expect(name).toContain('remote file')
+    expect(name).toContain('local file tools')
+    const dparams = tool.parameters as unknown as { properties: Record<string, { description: string }> }
+    const remotePath = dparams.properties.remotePath.description.toLowerCase()
+    expect(remotePath).toContain('remote ssh host')
+    const localPath = dparams.properties.localPath.description.toLowerCase()
+    expect(localPath).toContain('this machine')
+  })
+
+  it('ssh_exec is scoped to the remote host only', () => {
+    const tool = sshExecTool(engine(new StubEngine()))
+    const name = tool.description.toLowerCase()
+    expect(name).toContain('remote ssh host')
+    expect(name).toContain('never on this machine')
+    expect(name).toContain('local bash tool')
+  })
+})
+
+describe('ssh_cluster', () => {
+  it('enforces selector requirement in execute', async () => {
+    const stub = new StubEngine()
+    const tool = sshClusterTool(engine(stub))
+    await expect(run(tool, { command: 'uptime' })).rejects.toThrow(/ssh_cluster requires aliases, environment, or tags/)
+    await expect(run(tool, { command: 'uptime', aliases: [] })).rejects.toThrow(/ssh_cluster requires aliases, environment, or tags/)
+    await expect(run(tool, { command: 'uptime', aliases: [' '], environment: '', tags: [] })).rejects.toThrow(/ssh_cluster requires aliases, environment, or tags/)
+
+    const valid = await run(tool, { command: 'uptime', aliases: ['srv-1'] })
+    expect(valid).toEqual({ results: [] })
+
+    const validEnv = await run(tool, { command: 'uptime', environment: 'production' })
+    expect(validEnv).toEqual({ results: [] })
+
+    const validTags = await run(tool, { command: 'uptime', tags: ['api'] })
+    expect(validTags).toEqual({ results: [] })
+  })
+
+  it('documents selector requirement in tool and parameter descriptions', () => {
+    const tool = sshClusterTool(engine(new StubEngine()))
+    expect(tool.description).toContain('at least one aliases, environment, or tags filter is required')
+    const params = tool.parameters as unknown as { properties: Record<string, { description: string }> }
+    expect(params.properties.aliases.description).toContain('at least one')
+    expect(params.properties.environment.description).toContain('at least one')
+    expect(params.properties.tags.description).toContain('at least one')
+  })
+})
+

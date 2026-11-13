@@ -6,48 +6,20 @@
  *
  * Policy: loopback requests (the desktop) pass without a device identity;
  * every non-loopback /api request must carry a live, non-revoked device
- * cookie. This makes the QR the only way into a LAN-exposed dsh web and
- * gives "停止" real teeth: revoked devices 403 on their next request,
- * including the mux/SSE stream (which then dies on reconnect).
+ * cookie — intended to make the QR the only way into a LAN-exposed dsh web
+ * and to give "停止" real teeth for direct /api callers.
+ *
+ * Cohort reality (0.1.2-alpha.2): NOTHING emits api/gate in the official
+ * runtime, so this listener never fires there and direct /api is governed
+ * solely by the harness fence + browser-auth cookie. The pairing gate with
+ * real teeth lives on the plugin's own /remote channel (remote-api.ts); the
+ * listener stays wired for cohort lines that do carry the seam, and the
+ * README security model states the gap plainly.
  */
 
 import type { IncomingMessage } from 'node:http'
 import type { PairingService } from './pairing.ts'
-
-/**
- * Whether a normalized URL hostname names the local loopback authority.
- * Semantics mirror the connection package's internal predicate (localhost,
- * IPv6 loopback, any IPv4 address in 127/8); it is reimplemented here because
- * the connection package no longer exports it — the fence now lives inside
- * the connection plugin, and external host plugins only need the
- * classification, not the whole trust decision.
- * @param hostname - WHATWG URL hostname (IPv6 literals retain brackets).
- * @returns true for localhost, IPv6 loopback, or any IPv4 address in 127/8.
- */
-export function isLoopbackHostname(hostname: string): boolean {
-  if (hostname === 'localhost' || hostname === '[::1]') return true
-  const parts = hostname.split('.')
-  return parts.length === 4
-    && parts[0] === '127'
-    && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
-}
-
-/** Whether a socket remote address names the loopback range (127/8, ::1, IPv4-mapped). */
-export function isLoopbackAddress(address: string | undefined): boolean {
-  if (address === undefined) return false
-  const normalized = address.toLowerCase()
-  if (normalized === '::1') return true
-  if (normalized.startsWith('::ffff:')) return isIPv4Loopback(normalized.slice('::ffff:'.length))
-  return isIPv4Loopback(normalized)
-}
-
-/** IPv4 127/8 predicate (four decimal octets, first == 127). */
-function isIPv4Loopback(v4: string): boolean {
-  const parts = v4.split('.')
-  return parts.length === 4
-    && parts[0] === '127'
-    && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
-}
+import { isLoopbackAddress, isLoopbackHostname, isProxiedRequest } from './loopback.ts'
 
 /**
  * Read one cookie value from a Cookie header.
@@ -81,12 +53,49 @@ export function hostnameOf(request: IncomingMessage): string | undefined {
   }
 }
 
-/** Whether a request comes from the desktop loopback client (loopback socket AND loopback Host). */
-export function isLoopbackClient(request: IncomingMessage): boolean {
+/**
+ * Whether the request arrived at this process over a loopback upstream: a
+ * loopback socket and a loopback Host header, with the forwarding headers
+ * deliberately ignored. A reverse proxy (a Cloudflare tunnel, frp, nginx) dials
+ * 127.0.0.1:<port> and rewrites the Host to that upstream literal, so this is
+ * the shape of a tunneled request as much as of the desktop one.
+ *
+ * It answers "this process is reachable at a loopback authority", never "this
+ * request is the desktop": the desktop decision is {@link isLoopbackClient},
+ * which a forwarded request never satisfies. Only the fences that decide whether
+ * a Host is answerable at all (the pairing status view, the reachability beacon,
+ * the pairing entry pages) may be built on this predicate; every decision that
+ * hands out a credential or the desktop payload stays on {@link isLoopbackClient}
+ * (issue #1919 keeps #1906 shut: reachability for the visitor, payload and
+ * control plane for the desktop).
+ * @param request - node HTTP request.
+ * @returns true when the socket and the Host both name loopback.
+ */
+export function isLoopbackUpstream(request: IncomingMessage): boolean {
   const hostname = hostnameOf(request)
   if (hostname === undefined || !isLoopbackHostname(hostname)) return false
   const socket = request.socket as { remoteAddress?: string } | undefined
   return isLoopbackAddress(socket?.remoteAddress)
+}
+
+/**
+ * Whether a request comes from the desktop loopback client: a loopback upstream
+ * ({@link isLoopbackUpstream}) reached with no forwarding header. This is the
+ * same decision the shared copy makes in `isLoopbackRequest` (sans the browser
+ * same-origin markers, which the /api/pair routes apply separately through
+ * `isTrustedApiRequest`), and it carries the same proxy rule: a reverse proxy
+ * rewrites the Host to its own 127.0.0.1:<port> upstream and connects over
+ * loopback, so a request that arrives with CF-Connecting-IP or X-Forwarded-For
+ * is a forwarded one and is never the desktop (issue #1906). Every decision
+ * that grants the desktop payload or a control plane (the api/gate listener,
+ * the events stream, /api/pair/issue, /api/pair/stop, /api/pair/revoke,
+ * /api/pair/lan-bind) reads this predicate, so the rule holds for all of them.
+ * @param request - node HTTP request.
+ * @returns true for a local desktop request with no proxy in front of it.
+ */
+export function isLoopbackClient(request: IncomingMessage): boolean {
+  if (isProxiedRequest(request)) return false
+  return isLoopbackUpstream(request)
 }
 
 /**
@@ -109,13 +118,30 @@ export function makeGateListener(
   enabled: boolean | (() => boolean) = true,
 ): (request: IncomingMessage, method: string | undefined, next: () => boolean | Promise<boolean>) => boolean | Promise<boolean> {
   return (request, _method, next) => {
+    // Loopback clients (desktop at 127.0.0.1) always pass without cookie check.
     if (isLoopbackClient(request)) return next()
     const active = typeof enabled === 'function' ? enabled() : enabled
     if (!active) return false
     const require = typeof requirePairingForLan === 'function' ? requirePairingForLan() : requirePairingForLan
+    // When pairing is not required for LAN, non-loopback requests pass too.
     if (!require) return next()
-    const deviceId = readCookie(request.headers.cookie, service.config.cookieName)
-    if (deviceId === undefined) return false
-    return service.touchDevice(deviceId) ? next() : false
+    // Non-loopback origin: verify paired-device cookie. Sibling plugins that
+    // own their own prefixes (/pet, /git, /sidebar, …) consult the same cookie
+    // through the remoteWebUiPairing service — this listener only covers /api.
+    return isPairedDeviceRequest(service, request) ? next() : false
   }
+}
+
+/**
+ * Whether a request carries a live, non-revoked paired-device cookie for
+ * this service. Sibling host routes outside /api (the right-panel
+ * /sidebar/* routes, etc.) use the same check via the remoteWebUiPairing service.
+ * @param service - the pairing service that owns the device table.
+ * @param request - the incoming HTTP request.
+ * @returns true when the cookie names a live session (and lastSeenAt was refreshed).
+ */
+export function isPairedDeviceRequest(service: PairingService, request: IncomingMessage): boolean {
+  const deviceId = readCookie(request.headers.cookie, service.config.cookieName)
+  if (deviceId === undefined) return false
+  return service.touchDevice(deviceId)
 }

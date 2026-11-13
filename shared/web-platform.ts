@@ -1,17 +1,22 @@
 /**
  * Shared browser platform modules. Seeding, bundling externals, and Vite
  * aliases consume this list so their module identities cannot drift.
- * @module @deepseek-ai/dsh-client-web/src/platform
+ * Mirrors the shell's frozen module table (dsh-web-frontend staticModules,
+ * verified against the 0.2.2-rc.2 cohort dist bundle
+ * (dsh-web-frontend/dist/assets/index-*.js, the `staticModules` table): react,
+ * react/jsx-runtime, react-dom, react-dom/client, cordis, zod,
+ * @tanstack/react-virtual, dsh-client-store, dsh-client-ui-slots,
+ * dsh-client-ui-primitives, dsh-client-ui-dockkit).
+ * @module dsh-web/shared/web-platform
  */
 
 /** The module specifiers the shell shares into the frozen module table. */
 export const PLATFORM_MODULES = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis',
+  'zod',
+  '@tanstack/react-virtual',
+  '@deepseek-ai/dsh-client-store',
   '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-web-react',
   '@deepseek-ai/dsh-client-ui-primitives',
-  '@deepseek-ai/dsh-client-schema-form',
+  '@deepseek-ai/dsh-client-ui-dockkit',
 ] as const
-
-/** One platform module specifier (a seed-table key). */
-export type PlatformModule = (typeof PLATFORM_MODULES)[number]

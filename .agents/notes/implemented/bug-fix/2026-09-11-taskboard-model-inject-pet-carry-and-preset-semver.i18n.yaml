@@ -1,0 +1,5 @@
+# Bilingual-pair consistency record (docs/i18n.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with git hash-object.
+2026-09-11-taskboard-model-inject-pet-carry-and-preset-semver.md: 33e52c6d03b4d4bee5c8a1c4f36734e5f7a79ae6
+2026-09-11-taskboard-model-inject-pet-carry-and-preset-semver.zh.md: 3535204c502f3a7b645183f3519b36d26c51f6a7

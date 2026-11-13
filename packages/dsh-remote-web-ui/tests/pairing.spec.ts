@@ -18,12 +18,46 @@ function makeService(overrides: Partial<PairingConfig> = {}) {
   return service
 }
 
+/** Pair one device with a User-Agent and return its session id. */
+function pairWith(service: PairingService, userAgent?: string): string {
+  const { token } = service.issue()
+  const result = service.accept(token, userAgent)
+  if (!result.ok) throw new Error(`pair failed: ${result.code}`)
+  return result.deviceId
+}
+
 let now = 0
 beforeEach0()
 
 function beforeEach0(): void {
   now = 1_000_000
 }
+
+describe('PairingService ingress status', () => {
+  it('operator carries the Cloudflare ingress-sync state in the snapshot, without repeated emits', () => {
+    // Given a service that has never run the ingress sync
+    const service = makeService()
+    expect(service.snapshot().ingress).toBeUndefined()
+    const seen: number[] = []
+    service.onState(() => { seen.push(seen.length) })
+    // When the sync reports an applied frame
+    const frame = {
+      state: 'applied' as const,
+      hostname: 'dsh.example.com',
+      port: 3080,
+      service: 'http://127.0.0.1:3080',
+      changed: false,
+      at: now,
+    }
+    service.setIngressStatus(frame)
+    // Then the snapshot carries it and one snapshot was emitted
+    expect(service.snapshot().ingress).toEqual(frame)
+    expect(seen).toHaveLength(1)
+    // And the same audit state with a newer timestamp is not a second event
+    service.setIngressStatus({ ...frame, at: now + 1 })
+    expect(seen).toHaveLength(1)
+  })
+})
 
 describe('PairingService', () => {
   it('issues one active token and replaces it on refresh (old link dies)', () => {
@@ -45,11 +79,15 @@ describe('PairingService', () => {
     expect(snapshot.tokenId).not.toBe(token)
   })
 
-  it('refuses a consumed token (one-time) with used', () => {
+  it('re-accepts a consumed token within the window, minting a fresh device', () => {
     const service = makeService()
     const { token } = service.issue()
-    expect(service.accept(token)).toMatchObject({ ok: true })
-    expect(service.accept(token)).toEqual({ ok: false, code: 'used' })
+    const first = service.accept(token)
+    expect(first).toMatchObject({ ok: true })
+    const second = service.accept(token)
+    expect(second).toMatchObject({ ok: true })
+    expect(second.ok && first.ok ? second.deviceId !== first.deviceId : false).toBe(true)
+    expect(service.hasDevice(second.ok ? second.deviceId : '')).toBe(true)
   })
 
   it('refuses an expired token as invalid', () => {
@@ -179,6 +217,73 @@ describe('PairingService', () => {
     const accepted = service.accept(token)
     expect(accepted.ok).toBe(true)
     expect(seen).toEqual(['waiting', 'waiting', 'connected'])
+    // Every wire field participates in the comparison. The posture frame is the
+    // one the layer emits with no accompanying phase/roster transition, so a
+    // missing term here silently stranded the desktop panel on a stale verdict.
+    const postures: unknown[] = []
+    const unsubscribe = service.onState(snapshot => { postures.push(snapshot.posture) })
+    service.setPosture({ checkedAt: 1, hosts: [{ host: 'a.example', exposed: true }] })
+    expect(postures).toHaveLength(1)
+    // A repeated identical round is still deduped.
+    service.setPosture({ checkedAt: 1, hosts: [{ host: 'a.example', exposed: true }] })
+    expect(postures).toHaveLength(1)
+    // A changed verdict reaches the stream.
+    service.setPosture({ checkedAt: 2, hosts: [{ host: 'a.example', exposed: false }] })
+    expect(postures).toHaveLength(2)
+    // A frame that is not the expected shape degrades to "changed" instead of
+    // throwing out of the setter: this comparison runs inside the emit path,
+    // outside the listener error containment. A null frame...
+    service.setPosture(null as unknown as undefined)
+    expect(postures).toHaveLength(3)
+    // ...and a null entry inside a real hosts array, which reaches the per-host
+    // comparison with a matching checkedAt.
+    service.setPosture({ checkedAt: 4, hosts: [{ host: 'a.example', exposed: false }] })
+    expect(postures).toHaveLength(4)
+    service.setPosture({ checkedAt: 4, hosts: [null] } as unknown as undefined)
+    expect(postures).toHaveLength(5)
+    unsubscribe()
+  })
+
+  it('throttles presence broadcasts: touch/heartbeat stay quiet until the sweep', () => {
+    const service = makeService()
+    const { token } = service.issue()
+    const accepted = service.accept(token)
+    const deviceId = accepted.ok ? accepted.deviceId : ''
+    const seen: { phase: string; lastSeenAt?: number }[] = []
+    service.onState(snapshot => { seen.push({ phase: snapshot.phase, lastSeenAt: snapshot.devices[0]?.lastSeenAt }) })
+    // A gated request refreshes presence but must not fan a snapshot out to
+    // the status listeners on the hot path.
+    const base = now
+    now += 3_000
+    expect(service.touchDevice(deviceId)).toBe(true)
+    expect(seen).toEqual([])
+    // The next sweep coalesces the refresh into exactly one broadcast.
+    service.sweep()
+    expect(seen).toEqual([{ phase: 'connected', lastSeenAt: base + 3_000 }])
+    // A heartbeat before the next sweep coalesces too, and a no-op sweep stays quiet.
+    now += 1_000
+    expect(service.heartbeat(deviceId)).toBe(true)
+    now += 1_000
+    service.sweep()
+    expect(seen).toEqual([
+      { phase: 'connected', lastSeenAt: base + 3_000 },
+      { phase: 'connected', lastSeenAt: base + 4_000 },
+    ])
+    service.sweep()
+    expect(seen).toHaveLength(2)
+  })
+
+  it('keeps structural notifications immediate (accept and revoke broadcast without a sweep)', () => {
+    const service = makeService()
+    const { token } = service.issue()
+    const seen: number[] = []
+    service.onState(snapshot => { seen.push(snapshot.deviceCount) })
+    const accepted = service.accept(token)
+    expect(accepted.ok).toBe(true)
+    expect(seen).toEqual([1])
+    const deviceId = accepted.ok ? accepted.deviceId : ''
+    expect(service.revoke(deviceId)).toBe(true)
+    expect(seen).toEqual([1, 0])
   })
 
   it('evicts the oldest device at the session cap', () => {
@@ -196,5 +301,132 @@ describe('PairingService', () => {
     expect(service.hasDevice(bId)).toBe(true)
     expect(service.hasDevice(cId)).toBe(true)
     expect(service.snapshot().deviceCount).toBe(2)
+  })
+
+  it('sweep deletes a session idle longer than idleExpireMs', () => {
+    const service = makeService({ idleExpireMs: 60_000 })
+    const { token } = service.issue()
+    const accepted = service.accept(token)
+    const deviceId = accepted.ok ? accepted.deviceId : ''
+    now += 60_001
+    service.sweep()
+    expect(service.hasDevice(deviceId)).toBe(false)
+    expect(service.snapshot().deviceCount).toBe(0)
+  })
+
+  it('touchDevice refuses an idle cookie without waiting for sweep', () => {
+    const service = makeService({ idleExpireMs: 60_000 })
+    const { token } = service.issue()
+    const accepted = service.accept(token)
+    const deviceId = accepted.ok ? accepted.deviceId : ''
+    now += 60_001
+    expect(service.touchDevice(deviceId)).toBe(false)
+    expect(service.hasDevice(deviceId)).toBe(false)
+  })
+
+  it('revoke drops one device and leaves the others', () => {
+    const service = makeService({ maxDevices: 4 })
+    const first = service.issue()
+    const a = service.accept(first.token)
+    const second = service.issue()
+    const b = service.accept(second.token)
+    const aId = a.ok ? a.deviceId : ''
+    const bId = b.ok ? b.deviceId : ''
+    expect(service.revoke(aId)).toBe(true)
+    expect(service.hasDevice(aId)).toBe(false)
+    expect(service.hasDevice(bId)).toBe(true)
+    expect(service.revoke('missing')).toBe(false)
+  })
+
+  it('surfaces devices in the snapshot with sanitized User-Agent', () => {
+    const service = makeService()
+    const { token } = service.issue()
+    service.accept(token, 'Mozilla/5.0 Phone')
+    const [device] = service.snapshot().devices
+    expect(device).toMatchObject({ online: true, userAgent: 'Mozilla/5.0 Phone' })
+    expect(device?.id).toMatch(/^tok-/)
+  })
+
+  it('operator names a device, sees the sanitized label, and clears it with a blank name', () => {
+    // Given a paired device.
+    const service = makeService()
+    const deviceId = pairWith(service, 'Mozilla/5.0 Phone')
+    // When the operator submits a name carrying control characters and padding...
+    expect(service.rename(deviceId, '  My   phone\u0000 ')).toBe(true)
+    // Then the snapshot carries the cleaned, capped label.
+    expect(service.snapshot().devices[0]).toMatchObject({ name: 'My phone' })
+    expect(service.rename(deviceId, 'x'.repeat(80))).toBe(true)
+    expect(service.snapshot().devices[0]?.name).toHaveLength(64)
+    // When a blank name is submitted, the label clears back to the UA fallback.
+    expect(service.rename(deviceId, '   ')).toBe(true)
+    expect(service.snapshot().devices[0]?.name).toBeUndefined()
+    expect(service.rename('missing', 'nope')).toBe(false)
+  })
+
+  it('operator sees a rename broadcast immediately and survive a sweep', () => {
+    // Given a paired device and a subscribed status stream.
+    const service = makeService()
+    const deviceId = pairWith(service, 'Mozilla/5.0 Phone')
+    const labels: (string | undefined)[] = []
+    service.onState(snapshot => { labels.push(snapshot.devices[0]?.name) })
+    // When the operator renames the device.
+    expect(service.rename(deviceId, 'Desk phone')).toBe(true)
+    // Then the label arrives on one immediate frame; a sweep adds nothing.
+    service.sweep()
+    expect(labels).toEqual(['Desk phone'])
+  })
+
+  it('operator cannot rename after stop (no live sessions remain)', () => {
+    // Given a paired device.
+    const service = makeService()
+    const deviceId = pairWith(service, 'Mozilla/5.0 Phone')
+    // When remote access stops and the operator tries to rename it...
+    service.stop()
+    // Then the rename is refused because the session is gone.
+    expect(service.rename(deviceId, 'nope')).toBe(false)
+  })
+
+  it('operator merges same-User-Agent duplicates into the most recently active row', () => {
+    // Given two pairing rows carrying the same User-Agent.
+    const service = makeService({ maxDevices: 4 })
+    const older = pairWith(service, 'Mozilla/5.0 Android Chrome')
+    now += 1_000
+    const newer = pairWith(service, 'Mozilla/5.0 Android Chrome')
+    // When one row is active more recently and the operator merges the group...
+    now += 1_000
+    expect(service.touchDevice(older)).toBe(true)
+    // Then activity, not pairing time, decides the survivor and frees the slot.
+    expect(service.mergeDuplicates([older, newer])).toEqual({ ok: true, deviceId: older })
+    expect(service.hasDevice(older)).toBe(true)
+    expect(service.hasDevice(newer)).toBe(false)
+    expect(service.snapshot().deviceCount).toBe(1)
+  })
+
+  it('operator cannot merge across different User-Agents or unknown ids', () => {
+    // Given two rows from genuinely different clients.
+    const service = makeService({ maxDevices: 4 })
+    const first = pairWith(service, 'UA-A')
+    const second = pairWith(service, 'UA-B')
+    // When a merge is attempted...
+    // Then it is refused, so the route can never become a bulk revoke.
+    expect(service.mergeDuplicates([first, second])).toEqual({ ok: false, code: 'not-duplicates' })
+    expect(service.hasDevice(first)).toBe(true)
+    expect(service.hasDevice(second)).toBe(true)
+    expect(service.mergeDuplicates([first])).toEqual({ ok: false, code: 'not-duplicates' })
+    expect(service.mergeDuplicates([first, 'missing'])).toEqual({ ok: false, code: 'unknown-device' })
+  })
+
+  it('operator keeps a name typed on the duplicate a merge drops', () => {
+    // Given two same-User-Agent rows where the dropped one is named.
+    const service = makeService({ maxDevices: 4 })
+    const survivor = pairWith(service, 'Mozilla/5.0 Android Chrome')
+    const dropped = pairWith(service, 'Mozilla/5.0 Android Chrome')
+    expect(service.rename(dropped, 'My phone')).toBe(true)
+    // When the survivor is the active row and the operator merges them...
+    now += 1_000
+    expect(service.touchDevice(survivor)).toBe(true)
+    // Then the survivor inherits the typed name instead of losing it.
+    expect(service.mergeDuplicates([survivor, dropped])).toEqual({ ok: true, deviceId: survivor })
+    expect(service.snapshot().devices[0]?.name).toBe('My phone')
   })
 })

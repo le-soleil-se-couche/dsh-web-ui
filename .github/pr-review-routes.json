@@ -1,0 +1,43 @@
+{
+  "comment": true,
+  "defaultRoute": {
+    "label": "默认负责人：未匹配类别时的兜底，指向所有者",
+    "reviewers": [
+      "zhu1090093659"
+    ],
+    "assignees": [
+      "zhu1090093659"
+    ],
+    "ai": false
+  },
+  "routes": [
+    {
+      "name": "plugins",
+      "label": "插件功能（任务看板 / 右侧面板 / 远程 Web UI / SSH / 设置 / 聚合包）",
+      "types": [
+        "插件功能（任务看板 / 右侧面板 / 远程 Web UI / SSH / 设置 / 聚合包）"
+      ],
+      "ai": false,
+      "reviewers": [
+        "zhu1090093659"
+      ],
+      "assignees": [
+        "zhu1090093659"
+      ]
+    },
+    {
+      "name": "maintenance",
+      "label": "维护 / 其他",
+      "types": [
+        "维护 / 其他"
+      ],
+      "ai": false,
+      "reviewers": [
+        "zhu1090093659"
+      ],
+      "assignees": [
+        "zhu1090093659"
+      ]
+    }
+  ]
+}

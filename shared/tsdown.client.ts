@@ -1,6 +1,6 @@
 /**
  * Shared tsdown preset for UI plugin client bundles — the single source of
- * truth for every dsh-web-ui plugin's build (previously copied per-package
+ * truth for every dsh-web plugin's build (previously copied per-package
  * from the DSH checkout's `packages/client/tsdown.client.ts`). Emits a
  * closure-factory artifact: the bundle calls window.__ModuleLoader__.load
  * ({id, factory}) and resolves externals through the injected require
@@ -13,9 +13,8 @@
  * shell's seed table in `./web-platform.ts`.
  */
 import { readFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
-import { createRequire } from 'node:module'
-import { basename, dirname, relative, resolve as resolvePath, sep } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, isAbsolute, relative, resolve as resolvePath, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { UserConfig } from 'tsdown'
 import { transform } from 'lightningcss'
@@ -35,7 +34,7 @@ const CSS_VIRTUAL_SUFFIX = '.mjs'
  * Everything else under @deepseek-ai/* is either a module-table entry
  * (external) or a leak the purity gate rejects.
  */
-export const INLINE_SAFE = /^@deepseek-ai\/dsh-(host-apiproxy|session|llm|tools|brand)(\/|$)/
+const INLINE_SAFE = /^@deepseek-ai\/dsh-(session|llm|tools|brand)(\/|$)/
 
 /** Generated descriptor/codec contribution with no shared runtime identity. */
 const GENERATED_REMOTE = /^@deepseek-ai\/dsh-[a-z0-9]+(?:-[a-z0-9]+)*\/remote$/
@@ -46,22 +45,31 @@ const GENERATED_REMOTE = /^@deepseek-ai\/dsh-[a-z0-9]+(?:-[a-z0-9]+)*\/remote$/
  */
 const SKIP_WORKSPACE_BUILD: UserConfig = { entry: '' }
 
-/**
- * Documented TEMPORARY exemption, not a platform module (hence not in
- * web-platform.ts): the snapshot-store engine (createSnapshotStore/defineStore/
- * shallowEqual) lives in runtime pending its promotion-time rehoming, and
- * five importers (locale, ui-layout, ui-conversation ×3) ride this single
- * exemption. At runtime the lazy CJS table answers the require natively:
- * runtime is an immediately-tier row, its factory is registered before any
- * dependent bundle materializes. TODO(webload/store-rehome): remove with the
- * store-engine relocation follow-up.
- */
-const RUNTIME_STORE_EXEMPTION = '@deepseek-ai/dsh-client-runtime/client'
-
-/** Externals resolved from the loader module table: the platform seed entries plus the documented runtime exemption. */
-export const CLIENT_EXTERNALS: readonly string[] = [...PLATFORM_MODULES, RUNTIME_STORE_EXEMPTION]
+/** Platform seed entries resolve through the supported host module table. */
+const CLIENT_EXTERNALS: readonly string[] = PLATFORM_MODULES
 
 const REPOSITORY_ROOT = fileURLToPath(new URL('..', import.meta.url))
+
+/**
+ * The building package's own package.json version, baked into the client
+ * bundle as __DSH_PKG_VERSION__ so the anonymous install heartbeat can report
+ * which release is actually running. Empty when the manifest is unreadable.
+ */
+function buildPackageVersion(): string {
+  try {
+    const manifest = JSON.parse(readFileSync(resolvePath(process.cwd(), 'package.json'), 'utf8'))
+    return typeof manifest.version === 'string' ? manifest.version : ''
+  } catch {
+    return ''
+  }
+}
+
+/** Rebase a physical path onto a repository-relative id when it lives under the repo. */
+function repositoryRelativePath(physical: string): string {
+  if (!isAbsolute(physical)) return physical
+  const repositoryPath = relative(REPOSITORY_ROOT, physical).split(sep).join('/')
+  return repositoryPath.startsWith('../') ? physical : repositoryPath
+}
 
 /** Rebase a physical lib-relative source onto a browser URL that mirrors the repository directories. */
 function browserSourcePath(source: string, sourcemapPath: string): string {
@@ -81,9 +89,10 @@ function browserSourcePath(source: string, sourcemapPath: string): string {
  * half.
  * @param id - plugin id (package name), stamped into the __ModuleLoader__.load
  * handoff and onto the injected style tags.
- * @param libEntry - node-half entries, spelled at the call site so the
- * package-invariants gate can see `src/invariant.ts` (or the tsc emit path) in
- * each package's own tsdown.config.ts.
+ * @param libEntry - node-half entries, spelled at the call site rather than
+ * derived from the source tree, so each package's own tsdown.config.ts states
+ * exactly what its node half emits, including a `./invariant` companion when
+ * the package ships one.
  * @param options - phase placement, lib overrides, companion Node configs.
  * @returns ENV-selected tsdown config for the current build face.
  */
@@ -95,63 +104,15 @@ export function clientBundle(
   const lib = clientLibraryConfig(id, libEntry, options.lib, options.libExternal)
   return ({ env }) => {
     const face = buildFace(env?.DSH_BUILD_FACE)
-    const client = clientConfig(id, face === undefined
+    // Host-only plugins (no src/client entry) skip the browser face entirely.
+    const hasClient = existsSync(resolvePath(process.cwd(), 'src/client/index.ts'))
+    const client = hasClient ? clientConfig(id, face === undefined
       ? 'src/client/index.ts'
-      : 'lib/types/client/index.js')
+      : 'lib/types/client/index.js', options.clientPlugins) : undefined
     const node = [lib, ...(options.companions ?? [])]
     if (face === 'host') return options.hostPhase === true ? node : [SKIP_WORKSPACE_BUILD]
-    if (face === 'client') return options.hostPhase === true ? [client] : [...node, client]
-    return [...node, client]
-  }
-}
-
-/**
- * The standalone mobile page bundle (served by the plugin's own route). It
- * boots WITHOUT the main UI's module loader, so everything — React, zod, the
- * harness wire contracts — is inlined into one self-contained module script.
- * The page talks to the host through plain fetch/WebSocket over /api.
- * @param id - plugin id (package name), used in tsdown diagnostics.
- * @param entry - the mobile page entry (e.g. `src/mobile/index.tsx`).
- * @returns a fully self-contained browser bundle config.
- */
-export function mobileBundle(id: string, entry: string): UserConfig {
-  const mobileRequire = createRequire(import.meta.url)
-  return {
-    name: `${id}/mobile`,
-    entry: { mobile: entry },
-    outDir: 'lib',
-    format: 'esm',
-    platform: 'browser',
-    target: 'es2022',
-    dts: false,
-    sourcemap: true,
-    clean: false,
-    // Fully self-contained: no externals, no module table.
-    external: [],
-    noExternal: [/.*/],
-    define: {
-      'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),
-      'import.meta.env.MODE': JSON.stringify(process.env.NODE_ENV ?? 'production'),
-      'import.meta.env': JSON.stringify({ MODE: process.env.NODE_ENV ?? 'production' }),
-    },
-    plugins: [{
-      // Wire contracts resolve through node_modules (the exports map lands on
-      // the real runtime values) instead of the tsconfig paths' declaration
-      // files, which would miss every value export.
-      name: 'dsh-mobile-value-resolution',
-      resolveId(source: string) {
-        const match = /^@deepseek-ai\/dsh-host-apiproxy\/api(?:\/.*)?$/.exec(source)
-        if (match === null) return null
-        try {
-          return mobileRequire.resolve(source)
-        } catch {
-          return null
-        }
-      },
-    }],
-    outputOptions: {
-      entryFileNames: 'mobile.js',
-    },
+    if (face === 'client') return options.hostPhase === true ? (client ? [client] : []) : (client ? [...node, client] : node)
+    return client ? [...node, client] : node
   }
 }
 
@@ -164,6 +125,10 @@ interface ClientBundleOptions {
   readonly lib?: UserConfig
   /** Extra Node-side externals (in addition to the default cordis entry). */
   readonly libExternal?: readonly (string | RegExp)[]
+  /** Extra browser-bundle resolve plugins, prepended ahead of the purity gate
+   *  so a package can remap generated specifiers onto sources before default
+   *  resolution (e.g. the aggregate's client-children alias). */
+  readonly clientPlugins?: ReadonlyArray<NonNullable<UserConfig['plugins']>>
 }
 
 type BuildFace = 'host' | 'client' | undefined
@@ -200,7 +165,7 @@ function clientLibraryConfig(
   }
 }
 
-function clientConfig(id: string, entry: string): UserConfig {
+function clientConfig(id: string, entry: string, extraPlugins: ReadonlyArray<NonNullable<UserConfig['plugins']>> = []): UserConfig {
   return {
     name: `${id}/client`,
     entry: { client: entry },
@@ -231,6 +196,7 @@ function clientConfig(id: string, entry: string): UserConfig {
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),
       'import.meta.env.MODE': JSON.stringify(process.env.NODE_ENV ?? 'production'),
       'import.meta.env': JSON.stringify({ MODE: process.env.NODE_ENV ?? 'production' }),
+      __DSH_PKG_VERSION__: JSON.stringify(buildPackageVersion()),
     },
     // tsdown auto-externalizes package dependencies; anything NOT in the
     // loader module table must inline instead (wire/type layers, zod, clsx —
@@ -238,7 +204,9 @@ function clientConfig(id: string, entry: string): UserConfig {
     // guaranteed runtime throw, so the rule is the table list itself: no
     // opinion for table entries (external above wins), bundle everything else.
     noExternal: (id: string) => (CLIENT_EXTERNALS.includes(id) ? undefined : true),
-    plugins: [{
+    // Package-level resolve plugins run FIRST: they may remap generated
+    // specifiers onto sources before the purity gate and default resolution.
+    plugins: [...extraPlugins, {
       // Bundle purity gate (build-time mirror of the module-edge rules):
       // platform seed entries stay external, inline-safe wire layers inline,
       // and every other @deepseek-ai value import is a build error — a
@@ -260,15 +228,23 @@ function clientConfig(id: string, entry: string): UserConfig {
       resolveId(source: string, importer: string | undefined) {
         if (!source.endsWith('.module.css')) return null
         const abs = importer !== undefined ? sourceAssetPath(source, importer) : source
-        return CSS_VIRTUAL_PREFIX + abs + CSS_VIRTUAL_SUFFIX
+        // Repo-relative virtual id: the emitted `//#region` comments would
+        // otherwise embed each builder's machine path, churning every
+        // committed lib/client.js when another machine rebuilds.
+        return CSS_VIRTUAL_PREFIX + repositoryRelativePath(abs) + CSS_VIRTUAL_SUFFIX
       },
       async load(virtualId: string) {
         if (!virtualId.startsWith(CSS_VIRTUAL_PREFIX)) return null
         const fileId = virtualId.slice(CSS_VIRTUAL_PREFIX.length, -CSS_VIRTUAL_SUFFIX.length)
-        // The virtual id otherwise hides the physical stylesheet from Rolldown's watch graph.
-        this.addWatchFile(fileId)
-        const source = await readFile(fileId)
+        // Rebase the repo-relative id back onto the physical stylesheet; the
+        // virtual id otherwise hides it from Rolldown's watch graph.
+        const physical = isAbsolute(fileId) ? fileId : resolvePath(REPOSITORY_ROOT, fileId)
+        this.addWatchFile(physical)
+        const source = await readFile(physical)
         const { code, exports: cssExports } = transform({
+          // Repo-relative filename: lightningcss's [hash] placeholder mixes
+          // the filename in, so an absolute path would yield machine-dependent
+          // class names on top of the region-comment noise.
           filename: fileId,
           code: source,
           cssModules: { pattern: '[hash]_[local]' },
@@ -282,9 +258,15 @@ function clientConfig(id: string, entry: string): UserConfig {
           classMap[local] = exp.name
         }
         // One <style data-plugin> per module file; idempotent under re-evaluation.
+        // The tag id carries the full repo-relative file id, not the basename:
+        // the aggregate build inlines several packages whose module files share
+        // a basename (eight settings-card.module.css copies), and a basename-only
+        // id lets the first tag suppress the others while each package's class
+        // map carries a path-derived hash — leaving every later copy's classes
+        // with no stylesheet at all.
         return [
           `const css = ${JSON.stringify(code.toString())};`,
-          `const tagId = ${JSON.stringify(`${id}/${basename(fileId)}`)};`,
+          `const tagId = ${JSON.stringify(`${id}/${fileId}`)};`,
           'if (typeof document !== \'undefined\' && document.querySelector(\'style[data-plugin-css=\' + JSON.stringify(tagId) + \']\') === null) {',
           '  const tag = document.createElement(\'style\');',
           `  tag.dataset.plugin = ${JSON.stringify(id)};`,

@@ -1,0 +1,574 @@
+/**
+ * dsh-web compat shim, browser half: the optional compatibility layer.
+ *
+ * The current dsh web shell renders its grid columns without the legacy
+ * `data-pane` / `data-dsh-frame` hooks (the columns carry css-module class
+ * names such as `*_sidebarCol` / `*_centerCol` / `*_detailsCol`). Plugins that
+ * mount at the DOM level through those legacy selectors stay silent without
+ * them, so this layer stamps the expected attributes onto the real shell
+ * elements and re-applies them on any DOM mutation (React re-renders that
+ * re-create the columns). It only ever WRITES attributes; it never removes
+ * nodes and never disturbs React's reconciliation. It also carries the
+ * responsive contract (RESPONSIVE_CSS) and the boot splash dismissal.
+ *
+ * Scope: this bundle is the patch layer and nothing else. It carries no family
+ * plugin code — each family mounts through its own loader row and serves its
+ * own browser half — so a page that does not need the compat patches never
+ * pays for a family UI it did not enable (issue #1901).
+ */
+import type { Context } from '@deepseek-ai/cordis'
+import { subscribeBodyInvalidations } from './body-mutations.ts'
+
+/** Column shims: element selector → attribute to stamp. */
+const COLUMN_SHIMS: ReadonlyArray<readonly [selector: string, attribute: string]> = [
+  ['[class*="sidebarCol"]', 'data-pane="sidebar"'],
+  ['[class*="centerCol"]', 'data-pane="conversation"'],
+  ['[class*="detailsCol"]', 'data-pane="details"'],
+]
+
+/** Stable hooks consumed by the responsive compat layer (never text/hash selectors). */
+export const RESPONSIVE_CSS = `
+[data-dsh-frame] { min-height: 0; }
+/* Viewport lock for installs with no active visual. The identical lock lives in
+   the skin-center shell-rendering stylesheet, but that stylesheet is inert
+   unless a catalog skin, custom theme or wallpaper is active, so a stock
+   install keeps html/body at their inherited "overflow: visible". Every
+   conversation disclosure control (the tool/step-process collapse bar carrying
+   the step summary, and the whole-turn process bar) calls focus() on itself
+   when toggled; a focused element below any document overflow scrolls the page
+   down by that overflow, which reads as the page being stretched downward with
+   the titlebar and sidebar top pushed out of the viewport: issue #1135's
+   symptom, reachable here with no skin active. Locking only the scrolling root
+   (never the app root element, whose own lock clipped content in
+   #1222/#1225) removes the overflow scroll target without touching the frame's
+   box in any state. Scoped to a root attribute the shim maintains so the rule
+   stays inert until the shell frame exists.
+
+   The scope is a plain attribute selector on purpose: it used to be an :has()
+   lookup for the frame on the root element, and that :has() was the whole cost
+   of this stylesheet. :has() makes every node insertion in the document
+   re-evaluate the ancestor chain up to <html>, so a terminal-style rebuild
+   (xterm re-creating its row elements on a fontSize change) paid it once per
+   inserted node and the price grew with the page's total node count. Measured
+   on a shell-shaped page driving real xterm 5.5.0 through a fontSize change:
+   22.5k nodes 12.3 ms / 12.5 ms, 64.5k nodes 31.5 ms / 13.1 ms, 127.5k nodes
+   58.1 ms / 24.2 ms
+   (:has() / attribute), i.e. the :has() variant alone scaled with page size.
+   An attribute on <html> costs one selector match per style invalidation and
+   gives the same lock: the shim writes it whenever it stamps the frame
+   (issue #1913). */
+html[data-dsh-frame-active],
+html[data-dsh-frame-active] > body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+/* macOS window-drag guard. The official base stylesheet turns every DIRECT body
+   child into a "-webkit-app-region: no-drag" region (its selector spares only
+   the app's own root element), so a body-level element that spans the viewport
+   subtracts the whole window from the macOS draggable region and cancels the
+   official [data-window-drag] chrome rows with it: the window
+   can no longer be dragged by its title area, and macOS no longer runs the
+   system double-click action (zoom to fit the screen) there. "pointer-events:
+   none" does not exempt an element from that computation - only a declaration
+   of its own does. Family decorations are exactly such elements: the skin
+   center mounts its six fixed decoration layers and the backdrop-blur veil as
+   full-viewport body children and declares them non-interactive (aria-hidden,
+   pointer-events: none; decoration must never eat clicks). The "initial"
+   keyword is the initial value ("none"), which leaves the element and its whole
+   subtree out of the app-region computation; the declaration must be !important
+   because the official selector outranks this one. */
+html[data-platform="darwin"] body > :is(
+  [data-dsh-skin-layer],
+  [data-dsh-boot-splash],
+  [aria-hidden="true"]
+) {
+  -webkit-app-region: initial !important;
+}
+[data-dsh-frame] [data-dsh-responsive-part="composer"],
+[data-dsh-frame] [data-dsh-responsive-part="sidebar-toggle"],
+  [data-dsh-frame] [data-dsh-responsive-part="menu"] { touch-action: manipulation; }
+@media (max-width: 768px) {
+  [data-dsh-frame] [data-dsh-responsive-part="sidebar-toggle"] { min-width: 44px; min-height: 44px; }
+  [data-dsh-frame] {
+    box-sizing: border-box;
+    height: 100dvh;
+    min-height: 100dvh;
+    max-height: 100dvh;
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-rows: 100%;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  /* The drawer contract is not a skin decision, and this rule is the END of
+     that argument, not the start of one. Read this before raising it again.
+
+     The skin-center loader force-scopes every skin selector under
+     html[data-dsh-skin="<id>"] (scopeSelectorText prefixes the scope to every
+     head), so a skin rule written as body [data-pane='sidebar'] { position:
+     relative; } is served as html[data-dsh-skin="..."] body
+     [data-pane='sidebar'] - specificity 0-2-2, above a plain 0-2-0. The pane
+     then falls back into the single mobile grid column and pushes the
+     conversation column out of the viewport (measured at a 700px viewport:
+     conversation y=700, height=0 - no usable session area at all).
+
+     position !important settles that case, but !important does not settle
+     everything: when BOTH sides are important the cascade returns to
+     specificity, and a skin rule like
+     div:has(> [data-slot="sidebar"]) { position: relative !important; }
+     (last-exile, porco-rosso, white-snake) is served as
+     html[data-dsh-skin="..."] body div:has(...) - 0-2-3 - which still wins.
+     The :is(...) below is deliberately redundant as a matcher and exists only
+     to lift this rule to 0-3-0 so the drawer beats that shape too. It is
+     verified against all seven affected skins; do not "simplify" it away.
+
+     BOUNDARY: this is the ceiling. If a future skin outranks 0-3-0 here, the
+     correct fix is to repair THAT SKIN, not to raise this specificity again.
+     Positioning the sidebar pane is not a skin's job: those rules want the
+     pane to be a containing block for their own glass layer, and position is
+     a side effect of that intent, not the intent. A skin that needs a
+     containing block should paint its layer inside the pane's slot child
+     instead. Chasing skins here would turn the mobile contract into an arms
+     race the shell cannot win.
+
+     The LAYER has to survive the same fight as the position, and it is the
+     official layout - not a skin - that it fights. The layout has a drawer
+     mode of its own: '.frame[data-sidebar-drawer] .sidebarCol' ships
+     'position: absolute; z-index: 71' at exactly this rule's 0-3-0 weight, and
+     the ui-layout client module injects that stylesheet at runtime, i.e. after
+     this tag, so document order hands the later sheet every plain declaration
+     here. The drawer then computed 71, this sheet's own 1050 mask painted over
+     it, and every tap on an open drawer landed on the frame element (#2013:
+     an open drawer with a grey cast, dismissed by its first tap). Both the
+     position and the layer are therefore !important: which layer the drawer
+     lives on must not be decided by the order two injected stylesheets happen
+     to load in. */
+  [data-dsh-frame] [data-pane="sidebar"]:is([data-pane="sidebar"]) {
+    position: absolute !important;
+    inset-block: 0;
+    inset-inline-start: 0;
+    z-index: 1100 !important;
+    width: min(88vw, 320px) !important;
+    max-width: 100%;
+    box-shadow: 0 12px 32px rgb(0 0 0 / 24%);
+    transform: translateX(0);
+    transition: transform 160ms ease;
+  }
+  /* The mask is the drawer's dimming, never its hit surface. At 1050 with the
+     default pointer-events it is a full-frame hit layer, and a pseudo-element's
+     hit reports its originating element - so a tap anywhere on the frame
+     answered "the frame", which is the shape #2013 reported from inside the
+     drawer (every row resolving to the frame) and how a tap meant for the
+     conversation under the dimming was swallowed. Dismissal keeps two owners
+     and both stay: the official drawer mask the layout paints under its own
+     drawer (it closes the drawer through the app), and the capture-phase click
+     handler that folds the drawer on any click outside the sidebar. */
+  [data-dsh-frame]:not([data-sidebar-collapsed])::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 1050;
+    background: rgb(0 0 0 / 24%);
+    pointer-events: none;
+  }
+  [data-dsh-frame][data-sidebar-collapsed] [data-pane="sidebar"] {
+    width: 52px !important;
+    transform: none;
+    pointer-events: none;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none;
+  }
+  [data-dsh-frame][data-sidebar-collapsed] [data-pane="sidebar"] > [data-slot="sidebar"] > :first-child > :not(:first-child),
+  [data-dsh-frame][data-sidebar-collapsed] [data-pane="sidebar"] > [data-slot="sidebar"] > :first-child > :first-child > :not([data-dsh-responsive-part="sidebar-toggle"]) {
+    display: none !important;
+  }
+  [data-dsh-frame][data-sidebar-collapsed] [data-pane="sidebar"] > [data-slot="sidebar"],
+  [data-dsh-frame][data-sidebar-collapsed] [data-pane="sidebar"] > [data-slot="sidebar"] > :first-child { background: transparent !important; }
+  [data-dsh-frame][data-sidebar-collapsed] [data-pane="sidebar"] [data-dsh-responsive-part="sidebar-toggle"] {
+    pointer-events: auto;
+    display: inline-flex !important;
+  }
+  /* The official settings dialog renders inside the sidebar foot, so collapsing
+     the rail would both hide it (the rule above) and freeze it (a collapsed pane
+     sets pointer-events: none). Restore only the subtree that actually carries an
+     open dialog; with no dialog open the collapsed rail is unchanged (issue #1510). */
+  [data-dsh-frame][data-sidebar-collapsed] [data-pane="sidebar"] > [data-slot="sidebar"] > :first-child > :not(:first-child):has([role="dialog"], [aria-modal="true"]) {
+    display: flex !important;
+    pointer-events: auto;
+  }
+  /* Center-view plugins own this marker; the aggregate shell owns its mobile offset. */
+  [data-dsh-frame][data-sidebar-collapsed] [data-dsh-center-view-back] {
+    margin-inline-start: 52px;
+  }
+  [data-dsh-frame] [data-pane="conversation"] {
+    min-width: 0;
+    width: 100%;
+    min-height: 0;
+  }
+  [data-dsh-frame] [data-pane="details"] {
+    display: none;
+  }
+  [data-dsh-frame]:not([data-details-collapsed]) [data-pane="details"] {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 1000;
+    width: 100%;
+    background: var(--dsw-alias-bg-base);
+  }
+  [data-dsh-frame][data-details-collapsed] [data-pane="details"] {
+    display: none;
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="composer"] {
+    max-width: 100%;
+    padding-inline: max(8px, env(safe-area-inset-left)) max(8px, env(safe-area-inset-right));
+  }
+  [data-dsh-frame] [data-slot="conversation.composer"],
+  [data-dsh-frame] [data-composer-card],
+  [data-dsh-frame] [data-input-scroll] {
+    min-width: 0;
+    max-width: 100%;
+  }
+  [data-dsh-frame] [data-composer-card] > :last-child {
+    min-width: 0;
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+  [data-dsh-frame] [data-slot="conversation.input.model"] {
+    min-width: 0;
+    max-width: 45%;
+  }
+  [data-dsh-frame] [data-slot="conversation.input.model"] :is(button, span) {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  [data-dsh-frame] textarea[data-phase] {
+    min-width: 0;
+    font-size: 16px;
+  }
+  [data-dsh-part="summon-button"] {
+    right: max(12px, env(safe-area-inset-right));
+    bottom: max(12px, env(safe-area-inset-bottom));
+    z-index: 40 !important;
+    width: 44px !important;
+    height: 44px !important;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 !important;
+    border-radius: 50% !important;
+    font-size: 0 !important;
+  }
+  [data-dsh-part="summon-button"]::before {
+    content: "";
+    display: block;
+    width: 18px;
+    height: 13px;
+    margin: auto;
+    border: 2px solid currentColor;
+    border-radius: 55% 65% 45% 55%;
+    transform: rotate(-8deg);
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="code"] {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="menu"] {
+    max-width: min(92vw, 360px);
+  }
+}
+@media (max-width: 768px) {
+  [data-dsh-frame] [data-dsh-responsive-part="conversation-header"] {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: minmax(32px, auto) minmax(44px, auto);
+    column-gap: 8px;
+    padding: 8px 8px 0 60px !important;
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="session-title-row"] {
+    display: contents;
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="session-title-cluster"] {
+    box-sizing: border-box;
+    grid-column: 1 / -1;
+    grid-row: 1;
+    min-width: 0;
+    padding-inline-end: 44px;
+    overflow: hidden;
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="session-tablist"] {
+    grid-column: 1;
+    grid-row: 2;
+    min-width: 0;
+    margin-top: 0;
+    padding-left: 0;
+    gap: 16px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="session-tablist"]::-webkit-scrollbar {
+    display: none;
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="session-tablist"] > [role="tab"] {
+    min-height: 44px;
+    flex: none;
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="session-utilities"] {
+    grid-column: 2;
+    grid-row: 2;
+    z-index: 2;
+    max-width: 42vw;
+    min-height: 44px;
+    margin-left: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="session-utilities"]::-webkit-scrollbar {
+    display: none;
+  }
+  [data-dsh-frame] [data-dsh-responsive-part="session-utilities"] :is(button, [role="button"]) {
+    min-width: 44px;
+    min-height: 44px;
+    flex: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-dsh-frame] [data-pane="sidebar"] { transition: none; }
+  [data-dsh-boot-splash] { transition: none; }
+}
+[data-dsh-boot-splash] {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: var(--dsw-alias-bg-base, #1e1e20);
+  opacity: 1;
+  pointer-events: none;
+  transition: opacity 160ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+[data-dsh-boot-splash][data-ready] {
+  opacity: 0;
+}
+`
+
+function ensureResponsiveStyle(): HTMLStyleElement {
+  const existing = document.querySelector<HTMLStyleElement>('style[data-dsh-compat="responsive"]')
+  if (existing !== null) return existing
+  const style = document.createElement('style')
+  style.dataset.dshCompat = 'responsive'
+  style.textContent = RESPONSIVE_CSS
+  document.head.appendChild(style)
+  return style
+}
+
+function stampSemanticParts(frame: Element): boolean {
+  let changed = false
+  const mark = (element: Element, part: string): void => {
+    if (element.getAttribute('data-dsh-responsive-part') === part) return
+    element.setAttribute('data-dsh-responsive-part', part)
+    changed = true
+  }
+  frame.querySelectorAll<HTMLElement>('[data-slot="conversation.composer"], [data-composer-card], [data-input-scroll], textarea[data-phase], [contenteditable="true"]').forEach(element => mark(element, 'composer'))
+  frame.querySelectorAll<HTMLElement>('pre').forEach(element => mark(element, 'code'))
+  frame.querySelectorAll<HTMLElement>('[role="menu"], [data-subagent-menu]').forEach(element => mark(element, 'menu'))
+  frame.querySelectorAll<HTMLElement>('[role="treeitem"]:not([data-dsh-part])').forEach(element => mark(element, 'sidebar-entry'))
+  const conversation = frame.querySelector<HTMLElement>('[data-pane="conversation"]')
+  const headerSlot = conversation?.querySelector<HTMLElement>('[data-slot="conversation.session.header"]')
+  const slottedHeader = headerSlot?.querySelector<HTMLElement>(':scope > header') ?? null
+  const scrollport = conversation?.querySelector<HTMLElement>('[data-conversation-scroll]') ?? null
+  const siblingHeader = scrollport?.previousElementSibling ?? null
+  const conversationHeader = slottedHeader
+    ?? (siblingHeader?.tagName === 'HEADER' && siblingHeader.parentElement === scrollport?.parentElement ? siblingHeader : null)
+  if (conversationHeader !== null) {
+    mark(conversationHeader, 'conversation-header')
+    const titleRow = conversationHeader.firstElementChild
+    if (titleRow !== null && titleRow.getAttribute('role') !== 'tablist') {
+      mark(titleRow, 'session-title-row')
+      const titleCluster = titleRow.firstElementChild
+      const utilities = titleCluster?.nextElementSibling
+      if (titleCluster !== null && titleCluster !== undefined) mark(titleCluster, 'session-title-cluster')
+      if (utilities !== null && utilities !== undefined) mark(utilities, 'session-utilities')
+    }
+    const tablist = conversationHeader.querySelector<HTMLElement>(':scope > [role="tablist"]')
+    if (tablist !== null) mark(tablist, 'session-tablist')
+  }
+  const sidebar = frame.querySelector<HTMLElement>('[data-pane="sidebar"]')
+  const sidebarSlot = sidebar?.querySelector<HTMLElement>(':scope > [data-slot="sidebar"]')
+  const logoRow = sidebarSlot?.firstElementChild?.firstElementChild
+  const logoButtons = logoRow?.querySelectorAll<HTMLElement>(':scope > button, :scope > [role="button"]')
+  const toggle = logoButtons?.item((logoButtons.length || 1) - 1)
+  if (toggle !== null && toggle !== undefined) mark(toggle, 'sidebar-toggle')
+  return changed
+}
+
+function installMobileSidebarDismiss(frame: HTMLElement): () => void {
+  let raf = 0
+  const onClick = (event: Event): void => {
+    const target = event.target
+    if (!(target instanceof Element)) return
+    if (typeof window.matchMedia !== 'function' || !window.matchMedia('(max-width: 768px)').matches) return
+    const sidebar = frame.querySelector<HTMLElement>('[data-pane="sidebar"]')
+    const toggle = frame.querySelector<HTMLElement>('[data-dsh-responsive-part="sidebar-toggle"]')
+    if (!frame.hasAttribute('data-sidebar-collapsed') && sidebar !== null && !sidebar.contains(target)) {
+      event.preventDefault()
+      event.stopPropagation()
+      toggle?.click()
+      return
+    }
+    if (target.closest('[data-dsh-responsive-part="sidebar-toggle"]') !== null) return
+    // A group row toggles its own aria-expanded in place, so folding the drawer
+    // on that tap hides the rows it just revealed; its menu trigger opens a
+    // menu the fold would discard (issue #1716). The group row's trailing
+    // new-session button navigates away and keeps the fold, matching the
+    // remote package's own workspace-row rule.
+    const sessionRow = target.closest('[class*="sessionRow"]')
+    if (sessionRow === null && target.closest('[class*="projectRow"]') !== null) {
+      const actions = target.closest('[class*="rowActions"]')
+      if (actions === null) return
+      const buttons = actions.querySelectorAll('button')
+      if (target.closest('button') !== buttons[buttons.length - 1]) return
+    }
+    if (sessionRow === null && target.closest('[data-dsh-part="sidebar-entry"]') === null && target.closest('[role="treeitem"]') === null) return
+    if (raf !== 0) cancelAnimationFrame(raf)
+    raf = requestAnimationFrame(() => {
+      raf = 0
+      if (!frame.hasAttribute('data-sidebar-collapsed')) {
+        toggle?.click()
+      }
+    })
+  }
+  frame.addEventListener('click', onClick, true)
+  return () => {
+    frame.removeEventListener('click', onClick, true)
+    if (raf !== 0) cancelAnimationFrame(raf)
+  }
+}
+
+/** Root attribute the viewport-lock rules in RESPONSIVE_CSS are scoped to. */
+const FRAME_LOCK_ATTRIBUTE = 'data-dsh-frame-active'
+
+/** One pass over the current DOM. Returns false once every stamp is already in place. */
+function applyShims(): boolean {
+  let changed = false
+  for (const [selector, attribute] of COLUMN_SHIMS) {
+    const el = document.querySelector(selector)
+    const eq = attribute.indexOf('=')
+    const name = attribute.slice(0, eq)
+    const value = attribute.slice(eq + 1).replace(/^"|"$/g, '')
+    if (el !== null && el.getAttribute(name) !== value) {
+      el.setAttribute(name, value)
+      changed = true
+    }
+  }
+  // The frame is the grid item that parents the sidebar column.
+  const frame = document.querySelector('[class*="sidebarCol"]')?.parentElement ?? null
+  if (frame !== null && frame.getAttribute('data-dsh-frame') !== '') {
+    frame.setAttribute('data-dsh-frame', '')
+    changed = true
+  }
+  if (frame !== null) changed = stampSemanticParts(frame) || changed
+  // The viewport lock is scoped to this root attribute rather than to
+  // `html:has([data-dsh-frame])`; see RESPONSIVE_CSS. It mirrors the frame's
+  // presence, so it is cleared again when React replaces the shell and the
+  // next pass finds no frame (the lock must never outlive the frame it locks).
+  if (syncFrameLock(frame !== null)) changed = true
+  return changed
+}
+
+/**
+ * Mirror the shell frame's presence onto the document root.
+ * @param present - whether a stamped frame is currently in the document.
+ * @returns whether the root attribute changed.
+ */
+function syncFrameLock(present: boolean): boolean {
+  const root = document.documentElement
+  if (root === null) return false
+  if (root.hasAttribute(FRAME_LOCK_ATTRIBUTE) === present) return false
+  if (present) root.setAttribute(FRAME_LOCK_ATTRIBUTE, '')
+  else root.removeAttribute(FRAME_LOCK_ATTRIBUTE)
+  return true
+}
+
+function installBootShield(): { dismiss: () => void; remove: () => void } {
+  if (typeof document === 'undefined') return { dismiss: () => {}, remove: () => {} }
+  let splash = document.querySelector<HTMLElement>('div[data-dsh-boot-splash]')
+  if (splash === null) {
+    splash = document.createElement('div')
+    splash.setAttribute('data-dsh-boot-splash', '')
+    document.body.appendChild(splash)
+  }
+  let dismissed = false
+  let fadeTimer = 0
+  const dismiss = (): void => {
+    if (dismissed) return
+    dismissed = true
+    splash?.setAttribute('data-ready', '')
+    fadeTimer = window.setTimeout(() => {
+      splash?.remove()
+    }, 180)
+  }
+  const timeout = window.setTimeout(dismiss, 1000)
+  return {
+    dismiss,
+    remove: () => {
+      window.clearTimeout(timeout)
+      window.clearTimeout(fadeTimer)
+      splash?.remove()
+    },
+  }
+}
+
+/** Required services: none — the shim must run before any DOM mount waits. */
+export const inject = [] as const
+
+/**
+ * Register the shim for the page lifetime.
+ * @param ctx - client root context.
+ */
+export function apply(ctx: Context): void {
+  // This half is the compat layer only. Every family plugin mounts through its
+  // own loader row and brings its own browser half, so nothing is imported or
+  // mounted here: the bundle used to carry an inlined copy of all 13 family
+  // clients, which made the page download and evaluate 2.9 MB before any
+  // family surface could render (issue #1901).
+  ctx.effect(() => {
+    const responsiveStyle = ensureResponsiveStyle()
+    const bootShield = installBootShield()
+    applyShims()
+    let removeMobileDismiss = (): void => {}
+    let dismissFrame: HTMLElement | null = null
+    let resolvedFrame: HTMLElement | null = null
+    const ensureMobileDismiss = (): void => {
+      // The frame element is stable for the page lifetime; re-query only when
+      // the cached one is gone. A document.querySelector per mutation batch
+      // was paid for every streaming commit even though the answer never
+      // changed.
+      if (resolvedFrame !== null && !resolvedFrame.isConnected) resolvedFrame = null
+      const frame = resolvedFrame ?? document.querySelector<HTMLElement>('[data-dsh-frame]')
+      resolvedFrame = frame
+      if (frame === null) return
+      bootShield.dismiss()
+      if (frame === dismissFrame) return
+      removeMobileDismiss()
+      removeMobileDismiss = installMobileSidebarDismiss(frame)
+      dismissFrame = frame
+    }
+    ensureMobileDismiss()
+    // The shell renders after boot settlement and React can re-create the
+    // columns on re-render. The hub already coalesces callbacks per frame;
+    // scheduling another frame here would delay hooks and leave work alive
+    // after this effect is disposed. Attribute writes remain idempotent.
+    const unsubscribeBody = subscribeBodyInvalidations(() => {
+      applyShims()
+      ensureMobileDismiss()
+    })
+    return () => {
+      unsubscribeBody()
+      bootShield.remove()
+      responsiveStyle.remove()
+      removeMobileDismiss()
+    }
+  })
+}
