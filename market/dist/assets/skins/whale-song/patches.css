@@ -1,0 +1,172 @@
+[id="root"] {
+  background: none;
+}
+
+a {
+  color: #2f6fb8;
+}
+
+a:visited {
+  color: #6a5fa8;
+}
+
+body[data-ds-dark-theme] a {
+  color: #8ab4de;
+}
+
+body[data-ds-dark-theme] a:visited {
+  color: #a58fdc;
+}
+
+:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 2px;
+}
+
+[data-pane="sidebar"] {
+  color: var(--dsw-alias-label-primary);
+}
+
+[role="tooltip"] {
+  background: var(--dsw-alias-tooltip-bg);
+  color: var(--dsw-alias-tooltip-fg);
+}
+
+[role="dialog"], [role="dialog"] [class*="navCell"]:not([aria-current="true"]) {
+  color: var(--dsw-alias-label-primary);
+}
+
+button[role="tab"], button[role="tab"]:hover, button[role="tab"]:active, button[role="tab"]:disabled, button[role="tab"]:hover:not(:disabled), button[role="tab"]:active:not(:disabled) {
+  box-shadow: none;
+  text-shadow: none;
+  color: var(--dsw-alias-label-primary);
+  filter: none;
+  opacity: 1;
+  background-color: #0000;
+  background-image: none;
+  border: 0;
+  transform: none;
+}
+
+[data-aionui-explorer-col], [data-aionui-preview-col], .aionui-root {
+  backdrop-filter: blur(12px);
+}
+
+.aionui-dialog, .aionui-menu, .aionui-toast {
+  backdrop-filter: blur(14px);
+}
+
+.aionui-overlay {
+  background: #0a1e4a66;
+}
+
+body[data-ds-dark-theme] .aionui-overlay {
+  background: #0000008c;
+}
+
+button, a, .aionui-btn, .aionui-menu-item, .aionui-explorer-handle, .aionui-preview-handle {
+  transition: background-color .13s, border-color .13s, box-shadow .13s, color .13s, opacity .13s;
+}
+
+::-webkit-scrollbar-thumb {
+  transition: background-color .13s;
+}
+
+a:hover {
+  color: #16315f;
+  text-decoration: underline;
+}
+
+a:active {
+  color: #122b54;
+}
+
+body[data-ds-dark-theme] a:hover {
+  color: #b8c4e4;
+}
+
+body[data-ds-dark-theme] a:active {
+  color: #cdd6ee;
+}
+
+button:disabled, .aionui-btn:disabled, .aionui-menu-item-disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.aionui-btn:disabled:hover, .aionui-menu-item-disabled:hover {
+  box-shadow: none;
+  background-color: #0000;
+}
+
+.aionui-explorer-handle, .aionui-preview-handle {
+  background: #dae3ee;
+}
+
+.aionui-explorer-handle:hover, .aionui-preview-handle:hover {
+  background: #82acd7;
+  box-shadow: 0 0 6px #4d8fd466;
+}
+
+body[data-ds-dark-theme] .aionui-explorer-handle, body[data-ds-dark-theme] .aionui-preview-handle {
+  background: #274070;
+}
+
+body[data-ds-dark-theme] .aionui-explorer-handle:hover, body[data-ds-dark-theme] .aionui-preview-handle:hover {
+  background: #4b6192;
+  box-shadow: 0 0 6px #8ab4de66;
+}
+
+.aionui-floating-expand:hover {
+  background: #e5f0f9;
+  border-color: #6fa1d5;
+}
+
+.aionui-floating-expand:active {
+  background: #d9e9f5;
+}
+
+body[data-ds-dark-theme] .aionui-floating-expand:hover {
+  background: #1c3460;
+  border-color: #6fa1d5;
+}
+
+body[data-ds-dark-theme] .aionui-floating-expand:active {
+  background: #213a68;
+}
+
+.aionui-collapse-chevron:hover {
+  color: #6fa1d5;
+}
+
+body[data-ds-dark-theme] .aionui-collapse-chevron:hover {
+  color: #a8c8e8;
+}
+
+.aionui-menu-item:not(.aionui-menu-item-disabled):hover {
+  background: #4d8fd41f;
+}
+
+body[data-ds-dark-theme] .aionui-menu-item:not(.aionui-menu-item-disabled):hover {
+  background: #8ab4de29;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button, a, .aionui-btn, .aionui-menu-item, .aionui-explorer-handle, .aionui-preview-handle, ::-webkit-scrollbar-thumb {
+    transition: none;
+  }
+}
+
+[data-phase="active"] [class*="composerSeat"] {
+  background: none !important;
+}
+
+[data-phase="active"] [class*="composerSeat"]:before {
+  content: "";
+  z-index: -1;
+  pointer-events: none;
+  background: linear-gradient(180deg, transparent 0px, var(--dsw-alias-bg-base) 36px);
+  backdrop-filter: blur(10px);
+  position: absolute;
+  inset: 0;
+}

@@ -1,0 +1,4 @@
+# Optional Workspace Tabs browser plugin. Install this package into a profile.
+- insert:
+    - id: ui-skin-workspace-tabs
+      name: '@linxin666/dsh-client-ui-workspace-tabs'

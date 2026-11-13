@@ -1,102 +1,68 @@
-# dsh-web-ui 插件包发布准备（内测已结束）
+# dsh-web 发布准备 (Release Preparation)
 
-> **快照说明（重要）**：本文档是**当前时点（2026-08-13）**的发布前检查快照。
-> 插件全家桶已结束内测，但**清单与版本仍可能调整**：包可能增删、版本可能调整、
-> 字段可能变动。本文档需随仓库变更**重新核对**，不得当作永久事实使用。
->
-> **红线（务必遵守）**：发布动作仍须先经仓库维护者明确批准，并按 registry 规范
-> 操作（`npm pack --dry-run` 级别的演练可先行）。
+## Fork 可选插件
 
-## 一、范围
+`packages/dsh-workspace-tabs`（`@linxin666/dsh-client-ui-workspace-tabs`）随本 fork 源码提供，基于 v0.4.18 与 DSH >=0.2.2-rc.2；仅本地路径安装，不进入 npm 发布或默认聚合清单。详见[工作区标签栏](../packages/dsh-workspace-tabs/README.zh.md)。
 
-`packages/` 与 `packages/skins/` 下共 21 个插件包（截至快照日）：
+## 范围
 
-| 目录 | 包名 | 当前版本 | private |
+本版本统一发布 `packages/` 下由 `scripts/lib/family-packages.mjs` 发现的 22 个公开家族包；根 package.json 与 shared 私有包不发布，根的 `version` 与家族包同步 bump（git 安装仓库根别名 bundle 时，插件管理器显示的就是它）。所有家族包采用统一版本号（当前为 0.4.8），皮肤中心只随包分发 `blue-fantasy`，其余皮肤由 Workshop 按需安装。
+
+皮肤中心、宠物、社区插件索引与预设中心已拆分为独立仓库并各自发版：`@linxin666/dsh-client-ui-skin-center`（[dsh-skins](https://github.com/zhu1090093659/dsh-skins)）、`@linxin666/dsh-pet`（[dsh-pet](https://github.com/zhu1090093659/dsh-pet)）、`@linxin666/dsh-client-ui-community-plugins`（[dsh-community-plugins](https://github.com/zhu1090093659/dsh-community-plugins)）、`@linxin666/dsh-client-ui-preset-center`（[dsh-presets](https://github.com/zhu1090093659/dsh-presets)）。本仓的聚合包按 semver 依赖它们，`satellites/` 下各 submodule 的 gitlink 固定市场站要拉取的内容。四个卫星仓与本仓发布同一个版本号：卫星先发、本仓后发，聚合包的依赖范围、锁定条目与 gitlink 随对齐一起更新，逐步流程见 [dsh-web-release 技能](../.agents/skills/dsh-web-release/SKILL.md)。
+
+| 目录 | npm 包 | 版本 | 发布状态 |
 | --- | --- | --- | --- |
-| packages/dsh-task-board | @linxin666/dsh-client-ui-task-board | 0.1.1 | true |
-| packages/dsh-git-graph | @linxin666/dsh-client-ui-git-graph | 0.1.1 | true |
-| packages/dsh-pet | @linxin666/dsh-pet | 0.1.1 | true |
-| packages/dsh-remote-web-ui | @linxin666/dsh-remote-web-ui | 0.1.1 | true |
-| packages/dsh-live-stats | @linxin666/dsh-live-stats | 0.1.1 | true |
-| packages/dsh-ssh | @linxin666/dsh-ssh | 0.1.1 | true |
-| packages/dsh-aionui-panel | @linxin666/dsh-client-ui-aionui-panel | 0.1.1 | true |
-| packages/dsh-web-ui-settings | @linxin666/dsh-client-ui-web-ui-settings | 0.1.1 | true |
-| packages/dsh-skins | @linxin666/dsh-skins（聚合） | 0.1.1 | true |
-| packages/dsh-web-ui-all | @linxin666/dsh-web-ui-all（聚合） | 0.1.1 | true |
-| packages/skins/dsh-workspace-tabs | @linxin666/dsh-client-ui-workspace-tabs | 0.1.1 | true |
-| packages/skins/qq98 | @linxin666/dsh-client-ui-skin-qq98 | 0.1.1 | true |
-| packages/skins/ths | @linxin666/dsh-client-ui-skin-ths | 0.1.1 | true |
-| packages/skins/xp | @linxin666/dsh-client-ui-skin-xp | 0.1.1 | true |
-| packages/skins/blue-fantasy | @linxin666/dsh-client-ui-skin-blue-fantasy | 0.1.1 | true |
-| packages/skins/dragon-heir | @linxin666/dsh-client-ui-skin-dragon-heir | 0.1.1 | true |
-| packages/skins/minecraft | @linxin666/dsh-client-ui-skin-minecraft | 0.1.1 | true |
-| packages/skins/whale-song | @linxin666/dsh-client-ui-skin-whale-song | 0.1.0 | true |
-| packages/skins/trading | @linxin666/dsh-client-ui-skin-trading | 0.1.2 | true |
-| packages/skins/skin-center | @linxin666/dsh-client-ui-skin-center | 0.1.1 | true |
-| packages/skins/miku | @linxin666/dsh-client-ui-skin-miku | 0.1.12 | true |
+| packages/dsh-agents | @linxin666/dsh-agents | 0.4.8 | public |
+| packages/dsh-diagrams | @linxin666/dsh-client-ui-diagrams | 0.4.14 | public |
+| packages/dsh-i18n | @linxin666/dsh-i18n | 0.4.8 | public |
+| packages/dsh-liangshen | @linxin666/dsh-liangshen | 0.4.8 | public |
+| packages/dsh-market | @linxin666/dsh-client-ui-market | 0.4.8 | public |
+| packages/dsh-message-edit | @linxin666/dsh-client-ui-message-edit | 0.4.8 | public |
+| packages/dsh-plugin-manager | @linxin666/dsh-client-ui-plugin-manager | 0.4.8 | public |
+| packages/dsh-remote-bridge | @linxin666/dsh-remote-bridge | 0.4.8 | public |
+| packages/dsh-remote-web-ui | @linxin666/dsh-remote-web-ui | 0.4.8 | public |
+| packages/dsh-session-archive | @linxin666/dsh-session-archive | 0.4.8 | public |
+| packages/dsh-session-id | @linxin666/dsh-client-ui-session-id | 0.4.8 | public |
+| packages/dsh-skill-explorer | @linxin666/dsh-client-ui-skill-explorer | 0.4.8 | public |
+| packages/dsh-ssh | @linxin666/dsh-ssh | 0.4.8 | public |
+| packages/dsh-task-board | @linxin666/dsh-client-ui-task-board | 0.4.8 | public |
+| packages/dsh-task-board-github | @linxin666/dsh-client-ui-task-board-github | 0.4.8 | public |
+| packages/dsh-task-board-remote | @linxin666/dsh-task-board-remote | 0.4.8 | public |
+| packages/dsh-task-board-team | @linxin666/dsh-client-ui-task-board-team | 0.4.8 | public |
+| packages/dsh-usage | @linxin666/dsh-usage | 0.4.8 | public |
+| packages/dsh-web-all | @linxin666/dsh-web-all | 0.4.8 | public |
+| packages/dsh-win-bash | @linxin666/dsh-win-bash | 0.4.8 | public |
+| packages/dsh-web-settings | @linxin666/dsh-client-ui-web-ui-settings | 0.4.8 | public |
 
-## 二、发布前检查结论（2026-08-11，已修复项标注 [已确认]）
+## 外部依赖与迁移说明
 
-### [阻断] 阻断项（不修复无法发布/无法被消费）
+- alpha 分支的聚合包没有任何外部依赖：`dsh-better-sidebar@0.19.1`（2026-09-11 发布的稳定版本）的 peer 区间 `^0.1.5-rc.1` 不覆盖本分支的 `0.2.2-rc.1` cohort，故 `aggregate.yml` 不再声明该行、`package.json` 不再依赖它、锁定它的 `minimumReleaseAgeExclude` 条目也已删除；右侧面板改为按需安装。稳定线 `dev` 仍内置 0.19.1 并保留对应锁定条目。
+- 历史聚合包命名迁移：从 `@linxin666/dsh-web-ui-all` 向 `@linxin666/dsh-web-all` 的迁移已在 0.3.3 完成并弃用旧包名，当前统一发布 `@linxin666/dsh-web-all`。
+- 自更新组件移除：`dsh-update`（`@linxin666/dsh-update`）已整包删除（2026-11-06），不再随本仓发布；注册表上保留的最后版本 `0.4.15` 仍可解析且未标记弃用；需要弃用时由包所有者执行 `npm deprecate @linxin666/dsh-update`。插件更新的能力由 DSH 0.2.2-rc.1 起的官方插件页版本检查承担，聚合侧只留 `update` tombstone 子路径与 `retiredPlugins` 登记。
+- 远程访问组件演进与弃用：`dsh-remote-web-ui`（`@linxin666/dsh-remote-web-ui`）已从聚合包 `dsh-web-all` 摘除并进入弃用期（以 tombstone 导出与 `retiredPlugins` 登记静默退役，计划下一版本删除），当前版本仍作为独立包发布供过渡期独立安装；公网与局域网接入栈（中继与隧道）已迁入 `@linxin666/dsh-remote-bridge`。
 
-1. **全部 20 包 `private: true`** — npm 直接拒绝发布 private 包
-   （`This package has been marked as private`）。发布前需逐个移除。
-   **（发布前需按流程移除，当前仍保留）**
-2. **聚合包 `workspace:*` 依赖原样进 tarball**（dsh-skins 7 处、dsh-web-ui-all 9 处）—
-   [已确认] **已确认修复方式**：实测 `pnpm pack` 会把 `workspace:*` 改写为真实版本号
-   （dsh-skins 7 处、dsh-web-ui-all 9 处全部改写为 0.1.1/0.1.0，无残留）。
-   发布时必须用 **`pnpm publish`**（不要用 `npm publish`），`npm pack` 不改写。
-3. **类型产物缺失（1 包）** — [已确认] **已修复**：
-   - dsh-task-board：新增 `tsconfig.build.json`（emitDeclarationOnly → lib/types），
-     build 脚本改为 `tsc -p tsconfig.build.json && tsdown`；已产出 18 个 .d.ts；
-4. **`@deepseek-ai/dsh-code-kline` 未发布** — 原为 ui-code-kline 与 dsh-web-ui-all
-   的依赖方（peerDeps/deps 引用），需在依赖它的包之前发布。
-   **（发布动作本身，无法提前修复；发布顺序已排定）**
-   [已确认] **已失效**：2026-08-12 调整移除 code-kline / ui-code-kline 包后，
-   该发布依赖不再存在，无需处理。
+## 兼容性边界
 
-### [建议] 建议项（registry 安装兼容性）— [已确认] 已修复
+所有 `web-ui-*` bundle id、`dsh-web-ui-market`、`/api/dsh-web-ui-settings` 与 `dsh-web-ui-settings-proxy-token` 请求头保持冻结。旧聚合包迁移由插件管理器的更新路径经共享映射执行。皮肤中心对当前工坊安装保持来源验证路径，仅当已安装 manifest 与钩子字节匹配审查通过的生成标识时才恢复预置钩子效果；该门禁已随皮肤中心迁至 dsh-skins 仓。创意工坊目录包含声明式 `whalechan-harness` 皮肤（本地 CC BY-NC-SA 4.0 资产，无执行钩子），其细粒度生成类选择器作为明确记录的前端重新构建兼容性边界保留。
 
-5. **peerDeps 版本声明不匹配**：git-graph / live-stats / pet / remote-web-ui
-   的 `@deepseek-ai/*` peerDeps
-   已从旧 `^0.0.1` 系列改为 **`^0.1.0-rc.6`**（与 npm 已发布版本匹配，避免 ERESOLVE）。
+本版本具有全新安装、单元迁移与 Linux CI 挂载证据。
 
-### [卫生] 卫生项
+## 发布检查门禁
 
-6. **LICENSE 文件缺失 11 包** — [已确认] **已补全**（BSD-3-Clause，dsh-external
-   contributors），打包验证 LICENSE 已进 tarball。
-7. **files 缺 `cordis.patch.yml`**（发布后 bundle patch 缺失会装不上）—
-   [已确认] **已补全**：task-board / live-stats
-   的 files 均加入 `cordis.patch.yml`（task-board 同时补齐
-   `src` 与 `lib/types/**/*.d.ts.map`）。打包验证全部进 tarball。
-8. **blue-fantasy 打包警告**：`MODULE_TYPELESS_PACKAGE_JSON`（packages/skins/
-   无 package.json，`tsdown.client.ts` 被按 CJS 重解析）与 tsdown
-   `external` 弃用提示。构建卫生问题，**不影响产物正确性**（打包产物正常），
-   未改动，待官方 tsdown 配置演进后统一处理。
+```sh
+pnpm sync-shared:check
+pnpm typecheck
+pnpm test
+pnpm test:scripts
+pnpm aggregate:check
+pnpm runtime-deps:check
+pnpm docs:check
+pnpm i18n:check
+pnpm market:fetch
+pnpm market:check
+pnpm libs:check
+pnpm build
+node scripts/verify-version.mjs 0.4.8
+```
 
-## 三、兼容性现状（npm 版 DSH × 插件）
-
-2026-08-13 用隔离环境（`DSH_HOME` 隔离 + `dsh plugin add link:`）实测
-npm 版 `@deepseek-ai/dsh@0.1.0-rc.6`：
-
-- web GUI 启动正常（HTTP 200），`dsh plugin` 安装 task-board / blue-fantasy 成功；
-- boot manifest 正确注册插件，`/plugins/@deepseek-ai/<pkg>/client.js` 可访问（200）；
-- 日志无 error/warn，插件 `dsh.client` 声明（platform/inject/exports["./client"]）
-  与 npm 版 `dsh-client-modules` 消费逻辑逐字段吻合。
-
-npm 侧已发布 @deepseek-ai 核心 SDK 包至 `0.1.0-rc.6`，插件包仍按本仓库版本管理。
-
-## 四、建议的发布流程（批准后执行）
-
-1. 同步官方版本号节奏（当前为 `0.1.0-rc.6`，与 @deepseek-ai/dsh 对齐）；
-2. 发布前仍需处理：移除 `private: true`（20 包）；
-3. 按依赖顺序发布（用 **`pnpm publish`**，自动改写 workspace:*）：
-   各功能包 > 皮肤包 > dsh-skins > web-ui-all；
-4. 逐包 `pnpm pack --dry-run` 复核 tarball 内容（注意：dry-run 仍会执行
-   prepack/prepare 脚本）；
-5. 发布动作前**必须**经维护者确认。
-
-## 五、重新核对时机
-
-插件清单或版本发生任何变更后（新增/删除包、升版本、改字段），本节结论即失效，
-需重新执行本文档的检查流程（字段扫描 + pack 演练 + peerDeps 核对）。
+CI 与发布挂载冒烟测试挂载目标为 `@deepseek-ai/dsh@0.2.2-rc.2`，与家族包通过 `dsh.engines.dsh >=0.2.2-rc.2` 声明的最低宿主版本一致。

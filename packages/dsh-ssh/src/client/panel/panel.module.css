@@ -1,105 +1,19 @@
 /**
  * dsh-ssh panel styles. Scoped by the plugin's own data attributes so nothing
  * leaks into the rest of the GUI; colors ride the dsh --dsw-* tokens so the
- * panel follows the active theme (light/dark and skins). The center-column
- * hide rules are attribute-scoped and must stay in this stylesheet (it is
- * imported by mount.tsx, so the styles load with the plugin).
+ * panel follows the active theme (light/dark and skins).
+ *
+ * The panel is a native main-slot page: the shell renders it only while this
+ * panel is selected, so this file carries no visibility rule and no rule over
+ * the conversation column, and the sidebar row is the shell's own panel row,
+ * so there is no injected entry row to style either.
  */
-
-/* --- center-column takeover (global rules, attribute-scoped) ----------------- */
-
-[data-pane='conversation'] {
-  position: relative;
-}
-
-/* The panel container rides inside the conversation grid item as an extra
-   trailing child; hidden unless the panel is active. */
-[data-dsh-ssh-view] {
-  position: absolute;
-  inset: 0;
-  display: none;
-  /* Above the conversation composer (z-index 7 in the 0.1.0-rc.6 shell) so the
-     panel and its modals paint over the input card, mirroring the task board
-     (issue #87). */
-  z-index: 60;
-  /* Opaque backdrop: the conversation subtree stays mounted under the panel.
-     Even if the hide rule below were defeated by a stronger host inline
-     style, this background keeps sticky code-block banners (host z-index 6)
-     from showing through the active panel (issue #100). */
-  background: var(--dsw-alias-bg-base);
-}
-
-/* The center column is single-occupant; the :not() guards keep the two
-   sibling panels (task board / ssh) from fighting over visibility if both
-   activation attributes ever coexist. */
-html[data-dsh-ssh-active]:not([data-dsh-taskboard-active]) [data-dsh-ssh-view] {
-  display: block;
-}
-
-/* While the panel is active, the conversation content underneath is hidden
-   (it stays mounted and stateful). The rule targets both the pane attribute
-   and the center-column class so the chat subtree (including the code-block
-   copy banner, issue #100) stays hidden whichever host container carries it. */
-html[data-dsh-ssh-active]:not([data-dsh-taskboard-active]) [data-pane='conversation'] > :not([data-dsh-ssh-view]),
-html[data-dsh-ssh-active]:not([data-dsh-taskboard-active]) [class*='centerCol'] > :not([data-dsh-ssh-view]) {
-  display: none !important;
-}
-
-/* --- sidebar entry row ------------------------------------------------------- */
-
-.entry {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  height: 32px;
-  padding: 0 12px;
-  background: transparent;
-  border: none;
-  border-radius: 8px;
-  color: var(--dsw-alias-label-secondary);
-  cursor: pointer;
-  font-size: 13px;
-  white-space: nowrap;
-}
-
-.entry:hover {
-  background: var(--dsw-specific-sidebar-nav-item-hover);
-  color: var(--dsw-alias-label-primary);
-}
-
-.entry[data-active] {
-  background: var(--dsw-specific-sidebar-nav-item-active);
-  color: var(--dsw-alias-label-primary);
-  font-weight: 600;
-}
-
-.entryIcon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
-}
-
-.entryLabel {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* Collapsed rail: icon-only, centered, matching the shell's 56px rail. */
-[data-dsh-frame][data-sidebar-collapsed] .entry {
-  justify-content: center;
-  padding: 0;
-  width: 100%;
-}
-
-[data-dsh-frame][data-sidebar-collapsed] .entryLabel {
-  display: none;
-}
 
 /* --- panel frame -------------------------------------------------------------- */
 
 .view {
+  height: 100%;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -130,6 +44,12 @@ html[data-dsh-ssh-active]:not([data-dsh-taskboard-active]) [class*='centerCol'] 
   font-weight: 700;
   color: var(--dsw-alias-label-primary);
   white-space: nowrap;
+}
+
+.backButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 /* --- tab bar ------------------------------------------------------------------ */
@@ -235,6 +155,81 @@ html[data-dsh-ssh-active]:not([data-dsh-taskboard-active]) [class*='centerCol'] 
   color: var(--dsw-alias-label-tertiary);
 }
 
+.groupBySelect {
+  padding: 6px 8px;
+  font-size: 13px;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-specific-input-major);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  outline: none;
+}
+
+/* --- host groups (#379) ------------------------------------------------------- */
+
+.groupSection + .groupSection {
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+
+.groupHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  position: sticky;
+  top: 0;
+  background: var(--dsw-alias-bg-base, var(--dsw-specific-input-major));
+}
+
+.groupToggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: none;
+  background: none;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  border-radius: 6px;
+}
+
+.groupToggle:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.groupChevron {
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid var(--dsw-alias-label-tertiary);
+  border-bottom: 1.5px solid var(--dsw-alias-label-tertiary);
+  transform: rotate(45deg);
+  transition: transform 120ms ease;
+  flex: none;
+  margin-bottom: 2px;
+}
+
+.groupChevron[data-collapsed] {
+  transform: rotate(-45deg);
+  margin-bottom: 0;
+}
+
+.groupName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.groupCount {
+  color: var(--dsw-alias-label-tertiary);
+  font-weight: 400;
+  flex: none;
+}
+
 /* --- tables ------------------------------------------------------------------- */
 
 .tableWrap {
@@ -328,6 +323,23 @@ html[data-dsh-ssh-active]:not([data-dsh-taskboard-active]) [class*='centerCol'] 
 }
 
 .badge[data-kind='password'] {
+  color: var(--dsw-alias-state-warn-primary);
+  border-color: var(--dsw-alias-state-warn-primary);
+}
+
+.badge[data-kind='agent'] {
+  color: var(--dsw-alias-state-success-primary);
+  border-color: var(--dsw-alias-state-success-primary);
+}
+
+.badge[data-kind='proxy'] {
+  margin-left: 6px;
+  color: var(--dsw-alias-state-business-primary);
+  border-color: var(--dsw-alias-state-business-primary);
+}
+
+.badge[data-kind='forward-agent'] {
+  margin-left: 6px;
   color: var(--dsw-alias-state-warn-primary);
   border-color: var(--dsw-alias-state-warn-primary);
 }
@@ -459,6 +471,27 @@ html[data-dsh-ssh-active]:not([data-dsh-taskboard-active]) [class*='centerCol'] 
   border: 1px solid var(--dsw-alias-border-l2);
   color: var(--dsw-alias-label-secondary);
   overflow-wrap: anywhere;
+}
+
+/* Import skip detail: what an import left out and why (#1448). */
+.importSkips {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.importSkipRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 12px;
 }
 
 .banner[data-kind='ok'] {
@@ -609,6 +642,108 @@ html[data-dsh-ssh-active]:not([data-dsh-taskboard-active]) [class*='centerCol'] 
   overflow: hidden;
 }
 
+/* Terminal tab strip (issue #1950): one row of host PTY sessions above the
+   toolbar. It scrolls sideways instead of wrapping so the controls above the
+   terminal never move as tabs accumulate. */
+.termTabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  flex: none;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+
+.termTab {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  max-width: 200px;
+  border-radius: 6px 6px 0 0;
+  border-bottom: 2px solid transparent;
+}
+
+.termTab[data-active] {
+  background: var(--dsw-alias-bg-layer-2);
+  border-bottom-color: var(--dsw-alias-state-business-primary);
+}
+
+.termTabLabel {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  padding: 5px 4px 5px 10px;
+  font-size: 12.5px;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.termTab[data-active] .termTabLabel {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+}
+
+.termTabAlias {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.termTabState {
+  flex: none;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.termTabState[data-state='error'] {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.termTabState[data-state='exited'] {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.termTabClose,
+.termTabNew {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-right: 4px;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--dsw-alias-label-tertiary);
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.termTabNew {
+  width: 24px;
+  margin: 2px 0 2px 4px;
+  font-size: 15px;
+}
+
+.termTabClose:hover,
+.termTabNew:hover:not(:disabled) {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.termTabNew:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .termWrap {
   position: relative;
   flex: 1;
@@ -621,8 +756,10 @@ html[data-dsh-ssh-active]:not([data-dsh-taskboard-active]) [class*='centerCol'] 
 
 .termContainer {
   position: absolute;
-  inset: 0;
-  padding: 8px 10px;
+  /* Inset offsets, not padding: FitAddon measures this element's height as
+     the drawable area, so padding here would be measured as terminal space
+     and clip the bottom line under a global border-box reset. */
+  inset: 8px 10px;
 }
 
 .termPlaceholder {

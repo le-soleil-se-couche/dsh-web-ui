@@ -5,15 +5,16 @@
  * SFTP upload/download/ls, and the connection probe.
  */
 
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect, createServer, type AddressInfo } from 'node:net'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import type { Client } from 'ssh2'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { SshEngine } from '../src/engine.ts'
 import { HostStore } from '../src/store.ts'
 import type { HostPayload } from '../src/protocol.ts'
-import { TEST_PASSWORD, TEST_USER, TestSshServer } from './helpers/ssh-server.ts'
+import { TEST_PASSWORD, TEST_USER, TestSshServer, onCommandStarted } from './helpers/ssh-server.ts'
 import { TestSshd } from './helpers/sshd.ts'
 
 let server: TestSshServer
@@ -30,6 +31,107 @@ function addHost(alias: string, overrides: Partial<HostPayload> = {}): void {
     auth: { kind: 'password', password: TEST_PASSWORD },
     ...overrides,
   } as HostPayload)
+}
+
+/** The slice of PoolRecord the fake SFTP tests need to inject. */
+interface FakePoolRecord {
+  client: Client
+  hops: Client[]
+  idleAt: number
+  pinned: boolean
+  broken: boolean
+  inFlight: number
+}
+
+/** Minimal stats shape consumed by the engine SFTP paths. */
+interface FakeStats {
+  isDirectory: () => boolean
+  isFile: () => boolean
+  size: number
+  mtime: number
+  mode: number
+}
+
+const FILE_STATS: FakeStats = {
+  isDirectory: () => false,
+  isFile: () => true,
+  size: 4,
+  mtime: 1_700_000_000,
+  mode: 0o644,
+}
+
+interface FakeSftpOptions {
+  statMode?: 'missing' | 'file'
+  fastPutError?: Error
+  readdirError?: Error
+}
+
+/** SFTPWrapper stand-in that records end() calls and honors the close guard. */
+class FakeSftp {
+  endCalls = 0
+  statCalls = 0
+  mkdirCalls = 0
+  fastPutCalls = 0
+  fastGetCalls = 0
+  readdirCalls = 0
+  onFastPut?: () => void
+  private readonly statMode: 'missing' | 'file'
+  private readonly fastPutError?: Error
+  private readonly readdirError?: Error
+  private readonly closeListeners: Array<() => void> = []
+
+  constructor(options: FakeSftpOptions = {}) {
+    this.statMode = options.statMode ?? 'missing'
+    this.fastPutError = options.fastPutError
+    this.readdirError = options.readdirError
+  }
+
+  once(event: string, listener: () => void): this {
+    if (event === 'close') this.closeListeners.push(listener)
+    return this
+  }
+
+  emitClose(): void {
+    this.closeListeners.shift()?.()
+  }
+
+  end(): void {
+    this.endCalls += 1
+  }
+
+  stat(_path: string, cb: (error: Error | undefined, stats?: FakeStats) => void): void {
+    this.statCalls += 1
+    if (this.statMode === 'file') cb(undefined, FILE_STATS)
+    else cb(new Error('no such file'), undefined)
+  }
+
+  mkdir(_path: string, cb: (error?: Error) => void): void {
+    this.mkdirCalls += 1
+    cb()
+  }
+
+  fastPut(_src: string, _dst: string, _options: unknown, cb: (error?: Error) => void): void {
+    this.fastPutCalls += 1
+    this.onFastPut?.()
+    cb(this.fastPutError)
+  }
+
+  fastGet(_src: string, _dst: string, _options: unknown, cb: (error?: Error) => void): void {
+    this.fastGetCalls += 1
+    cb()
+  }
+
+  readdir(_path: string, cb: (error: Error | undefined, list?: Array<{ filename: string; attrs: FakeStats }>) => void): void {
+    this.readdirCalls += 1
+    if (this.readdirError !== undefined) cb(this.readdirError, undefined)
+    else cb(undefined, [{ filename: 'a.txt', attrs: FILE_STATS }])
+  }
+}
+
+/** Insert a fake connected client into one engine's private pool. */
+function seedPooledSftp(engine: SshEngine, alias: string, client: Client): void {
+  const pool = (engine as unknown as { pool: Map<string, FakePoolRecord> }).pool
+  pool.set(alias, { client, hops: [], idleAt: Date.now(), pinned: false, broken: false, inFlight: 0 })
 }
 
 beforeAll(async () => {
@@ -77,6 +179,49 @@ describe('exec', () => {
     expect(Date.now() - started).toBeLessThan(5_000)
   })
 
+
+  it('operator who aborts a running command sees it cancelled, not replayed', async () => {
+    // Given a command the shim never answers, with the caller armed to cancel it
+    addHost('exec-abort')
+    const controller = new AbortController()
+    onCommandStarted((command) => {
+      // When the remote channel is open, cancel the call the way a tool call is cancelled
+      if (command === 'hang') controller.abort()
+    })
+    try {
+      const started = Date.now()
+      const result = await engine.exec('exec-abort', 'hang', 30_000, controller.signal)
+
+      // Then it settles as a cancellation, not as a timeout or a broken connection
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('cancelled by the caller')
+      expect(result.timedOut).toBe(false)
+      // And it settles on the abort rather than the 30s budget or a retry cycle
+      expect(Date.now() - started).toBeLessThan(10_000)
+    } finally {
+      onCommandStarted(undefined)
+    }
+  })
+
+  it('operator passing an already-aborted signal sees no command run at all', async () => {
+    // Given a signal that was cancelled before the call
+    addHost('exec-preabort')
+    const controller = new AbortController()
+    controller.abort()
+    const seen: string[] = []
+    onCommandStarted((command) => { seen.push(command) })
+    try {
+      // When the call runs against that signal
+      const result = await engine.exec('exec-preabort', 'hang', 30_000, controller.signal)
+
+      // Then it reports a cancellation
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('cancelled by the caller')
+    } finally {
+      onCommandStarted(undefined)
+    }
+  })
+
   it('fails cleanly for unknown aliases', async () => {
     await expect(engine.exec('nope', 'true')).rejects.toThrow(/not found/)
   })
@@ -106,6 +251,70 @@ describe('connection pool', () => {
     expect(result.success).toBe(true)
     expect(server.connectCount).toBe(before + 1)
   })
+
+  it('retries a mid-flight failure on a fresh connection within the attempt budget', async () => {
+    addHost('pool-midflight')
+    await engine.exec('pool-midflight', 'true')
+    const before = server.connectCount
+    const pending = engine.exec('pool-midflight', 'hang', 3_000)
+    await new Promise(resolve => setTimeout(resolve, 150))
+    server.killAllClients()
+    const result = await pending
+    // Attempt one died with the link; the retry re-ran on a fresh connection
+    // and surfaced the command timeout there instead of a connection error.
+    expect(result.timedOut).toBe(true)
+    expect(server.connectCount).toBe(before + 1)
+  }, 10_000)
+
+  it('operator applies a settings edit to the connection ceiling of later connections', () => {
+    // Given an engine whose options are read when a connection is built
+    // When the loader commits a new connectTimeoutMs without a remount
+    engine.setConnectTimeout(45_000)
+
+    // Then connections opened afterwards read the new ceiling
+    expect(engine.opts.connectTimeoutMs).toBe(45_000)
+    engine.setConnectTimeout(5_000)
+  })
+
+  it('dropAlias closes the pooled connection so the next exec reconnects', async () => {
+    addHost('pool-drop')
+    await engine.exec('pool-drop', 'true')
+    const before = server.connectCount
+    engine.dropAlias('pool-drop')
+    expect(engine.pool.has('pool-drop')).toBe(false)
+    const result = await engine.exec('pool-drop', 'echo hello')
+    expect(result.success).toBe(true)
+    expect(server.connectCount).toBe(before + 1)
+  })
+})
+
+describe('proxyCommand transport', () => {
+  /**
+   * A ProxyCommand that bridges its stdio to the embedded test server through
+   * a node one-liner, so the whole exec path runs over a real subprocess
+   * transport instead of a direct TCP connection (issue #1448).
+   */
+  function bridgeCommand(): string {
+    const script = "const net=require('net');const s=net.connect(" + String(server.port)
+      + ",'127.0.0.1');s.pipe(process.stdout);process.stdin.pipe(s)"
+    return '"' + process.execPath + '" -e "' + script + '"'
+  }
+
+  it('runs exec over a ProxyCommand and drops it with the pooled connection', async () => {
+    // A deliberately unreachable HostName: OpenSSH semantics say a
+    // ProxyCommand replaces the direct TCP connection entirely.
+    addHost('via-proxy', { host: '10.255.255.1', proxyCommand: bridgeCommand() })
+    const result = await engine.exec('via-proxy', 'echo hello')
+    expect(result.success).toBe(true)
+    expect(result.stdout.trim()).toBe('hello')
+    engine.dropAlias('via-proxy')
+    expect(engine.pool.has('via-proxy')).toBe(false)
+  }, 15_000)
+
+  it('surfaces a failing ProxyCommand instead of waiting for the handshake timeout', async () => {
+    addHost('proxy-broken', { proxyCommand: 'definitely-not-a-real-binary-xyz' })
+    await expect(engine.exec('proxy-broken', 'true')).rejects.toThrow(/ProxyCommand/)
+  }, 15_000)
 })
 
 describe('key auth', () => {
@@ -183,9 +392,34 @@ describe('tunnel', () => {
     expect(engine.stopTunnel(tunnel.id)).toBe(true)
     expect(engine.listTunnels()).toHaveLength(0)
   })
+
+  it('stopping one tunnel keeps sibling tunnels on the same alias forwarding', async () => {
+    addHost('tunnel-shared')
+    const first = await engine.startTunnel('tunnel-shared', { remotePort: server.echoPort })
+    const second = await engine.startTunnel('tunnel-shared', { remotePort: server.echoPort })
+    expect(engine.listTunnels()).toHaveLength(2)
+
+    expect(engine.stopTunnel(first.id)).toBe(true)
+    const reply = await new Promise<string>((resolve, reject) => {
+      const socket = connect(second.localPort, '127.0.0.1')
+      const timer = setTimeout(() => { socket.destroy(); reject(new Error('sibling tunnel echo timed out')) }, 3_000)
+      socket.on('connect', () => socket.write('still-alive'))
+      socket.on('data', (chunk: Buffer) => {
+        clearTimeout(timer)
+        socket.destroy()
+        resolve(chunk.toString('utf8'))
+      })
+      socket.on('error', (error) => { clearTimeout(timer); reject(error) })
+    })
+    expect(reply).toBe('still-alive')
+
+    // The last tunnel releases the shared connection.
+    expect(engine.stopTunnel(second.id)).toBe(true)
+    expect(engine.pool.has('tunnel-shared')).toBe(false)
+  })
 })
 
-describe('sftp (real sshd)', () => {
+describe.skipIf(process.platform === 'win32' || !existsSync('/usr/sbin/sshd'))('sftp (real sshd)', () => {
   it('uploads, lists, and downloads files', async () => {
     const sshd = await TestSshd.start()
     try {
@@ -216,6 +450,101 @@ describe('sftp (real sshd)', () => {
   })
 })
 
+describe('sftp channel release', () => {
+  it('ends every SFTP channel exactly once after repeated upload, download, and list calls', async () => {
+    const wrappers: FakeSftp[] = []
+    const statModes: Array<'missing' | 'file'> = ['missing', 'missing', 'file']
+    let opened = 0
+    const client = {
+      sftp(cb: (error: Error | undefined, sftp: unknown) => void): void {
+        const wrapper = new FakeSftp({ statMode: statModes[Math.min(opened, statModes.length - 1)] })
+        opened += 1
+        wrappers.push(wrapper)
+        cb(undefined, wrapper)
+      },
+    } as unknown as Client
+    const engine2 = new SshEngine(store, { idleTimeoutMs: 60_000, connectTimeoutMs: 5_000, defaultExecTimeoutMs: 5_000 })
+    const local = join(dir, 'sftp-release-src.txt')
+    const localOut = join(dir, 'sftp-release-out.txt')
+    writeFileSync(local, 'ping', 'utf8')
+    writeFileSync(localOut, 'pong', 'utf8')
+    try {
+      seedPooledSftp(engine2, 'sftp-release', client)
+      await engine2.upload('sftp-release', local, '/remote/one.txt', false)
+      await engine2.upload('sftp-release', local, '/remote/two.txt', false)
+      await engine2.download('sftp-release', '/remote/one.txt', localOut)
+      await engine2.ls('sftp-release', '/remote')
+
+      expect(wrappers).toHaveLength(4)
+      expect(wrappers[0]?.fastPutCalls).toBe(1)
+      expect(wrappers[1]?.fastPutCalls).toBe(1)
+      expect(wrappers[2]?.fastGetCalls).toBe(1)
+      expect(wrappers[3]?.readdirCalls).toBe(1)
+      for (const wrapper of wrappers) {
+        expect(wrapper.endCalls).toBe(1)
+        // A late peer close after release must not end the channel twice.
+        wrapper.emitClose()
+        expect(wrapper.endCalls).toBe(1)
+      }
+    } finally {
+      engine2.dispose()
+    }
+  })
+
+  it('ends the SFTP channel when an upload or list fails', async () => {
+    const wrappers: FakeSftp[] = []
+    let opened = 0
+    const client = {
+      sftp(cb: (error: Error | undefined, sftp: unknown) => void): void {
+        const wrapper = opened === 0
+          ? new FakeSftp({ statMode: 'missing', fastPutError: new Error('remote write failed') })
+          : new FakeSftp({ readdirError: new Error('readdir failed') })
+        opened += 1
+        wrappers.push(wrapper)
+        cb(undefined, wrapper)
+      },
+    } as unknown as Client
+    const engine2 = new SshEngine(store, { idleTimeoutMs: 60_000, connectTimeoutMs: 5_000, defaultExecTimeoutMs: 5_000 })
+    const local = join(dir, 'sftp-release-error-src.txt')
+    writeFileSync(local, 'ping', 'utf8')
+    try {
+      seedPooledSftp(engine2, 'sftp-release-error', client)
+      await expect(engine2.upload('sftp-release-error', local, '/remote/bad.txt', false)).rejects.toThrow(/remote write failed/)
+      await expect(engine2.ls('sftp-release-error', '/remote')).rejects.toThrow(/readdir failed/)
+
+      expect(wrappers).toHaveLength(2)
+      expect(wrappers[0]?.endCalls).toBe(1)
+      expect(wrappers[1]?.endCalls).toBe(1)
+    } finally {
+      engine2.dispose()
+    }
+  })
+
+  it('does not end twice when the channel closes before the operation settles', async () => {
+    const wrappers: FakeSftp[] = []
+    let wrapper: FakeSftp | undefined
+    const client = {
+      sftp(cb: (error: Error | undefined, sftp: unknown) => void): void {
+        wrapper = new FakeSftp({ statMode: 'missing' })
+        wrapper.onFastPut = () => wrapper!.emitClose()
+        wrappers.push(wrapper)
+        cb(undefined, wrapper)
+      },
+    } as unknown as Client
+    const engine2 = new SshEngine(store, { idleTimeoutMs: 60_000, connectTimeoutMs: 5_000, defaultExecTimeoutMs: 5_000 })
+    const local = join(dir, 'sftp-release-selfclose-src.txt')
+    writeFileSync(local, 'ping', 'utf8')
+    try {
+      seedPooledSftp(engine2, 'sftp-release-selfclose', client)
+      await engine2.upload('sftp-release-selfclose', local, '/remote/ok.txt', false)
+
+      expect(wrapper).toBeDefined()
+      expect(wrapper!.endCalls).toBe(1)
+    } finally {
+      engine2.dispose()
+    }
+  })
+})
 
 describe('cluster filters', () => {
   it('matches hosts carrying ALL requested tags', async () => {
@@ -226,9 +555,14 @@ describe('cluster filters', () => {
     expect(results.map(r => r.alias)).toEqual(['tag-both'])
   })
 
+  it('rejects cluster execution when no selectors are provided', async () => {
+    await expect(engine.cluster({ command: 'true' })).rejects.toThrow(/ssh_cluster requires aliases, environment, or tags/)
+    await expect(engine.cluster({ command: 'true', aliases: [] })).rejects.toThrow(/ssh_cluster requires aliases, environment, or tags/)
+  })
+
   it('rejects invalid maxWorkers', async () => {
-    await expect(engine.cluster({ command: 'true', maxWorkers: 0 })).rejects.toThrow(/maxWorkers/)
-    await expect(engine.cluster({ command: 'true', maxWorkers: -2 })).rejects.toThrow(/maxWorkers/)
+    await expect(engine.cluster({ command: 'true', aliases: ['tag-both'], maxWorkers: 0 })).rejects.toThrow(/maxWorkers/)
+    await expect(engine.cluster({ command: 'true', aliases: ['tag-both'], maxWorkers: -2 })).rejects.toThrow(/maxWorkers/)
   })
 })
 
@@ -258,7 +592,7 @@ describe('tunnel safety', () => {
   it('stops tunnels scoped by alias', async () => {
     addHost('tun-a')
     addHost('tun-b')
-    const a = await engine.startTunnel('tun-a', { remotePort: server.echoPort })
+    await engine.startTunnel('tun-a', { remotePort: server.echoPort })
     const b = await engine.startTunnel('tun-b', { remotePort: server.echoPort })
     const stopped = engine.stopAllTunnels('tun-a')
     expect(stopped).toBe(1)
@@ -317,6 +651,25 @@ describe('upload path rules', () => {
 })
 
 describe('probe', () => {
+  it('uses a cross-platform command to probe connectivity', async () => {
+    const execSpy = vi.spyOn(engine, 'exec').mockResolvedValue({
+      success: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: 'ok\n',
+      stderr: '',
+      durationMs: 1,
+    })
+
+    try {
+      const result = await engine.test('probe-command')
+      expect(execSpy).toHaveBeenCalledWith('probe-command', 'echo ok', 10_000)
+      expect(result).toEqual({ ok: true, latencyMs: 1 })
+    } finally {
+      execSpy.mockRestore()
+    }
+  })
+
   it('reports a working connection', async () => {
     addHost('probe-host')
     const result = await engine.test('probe-host')

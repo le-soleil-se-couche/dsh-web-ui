@@ -29,7 +29,10 @@ interface FormState {
   keyPath: string
   passphrase: string
   password: string
+  agentPath: string
   proxyJump: string
+  proxyCommand: string
+  forwardAgent: boolean
   description: string
   environment: string
   tags: string
@@ -52,7 +55,10 @@ function blankOf(editing: SshHostSummary | null | undefined): FormState {
     keyPath: '',
     passphrase: '',
     password: '',
+    agentPath: '',
     proxyJump: (editing?.proxyJump ?? []).join(', '),
+    proxyCommand: editing?.proxyCommand ?? '',
+    forwardAgent: editing?.forwardAgent === true,
     description: editing?.description ?? '',
     environment: editing?.environment ?? '',
     tags: (editing?.tags ?? []).join(', '),
@@ -92,23 +98,43 @@ export function HostFormDialog({ api, editing, onClose, onSaved }: HostFormDialo
       setError(tt('form.portInvalid'))
       return
     }
+    // A password-auth host needs a password on create; when editing, a blank
+    // secret field preserves the stored credential instead.
+    if (editing == null && form.authKind === 'password' && form.password === '') {
+      setError(tt('form.passwordRequired'))
+      return
+    }
     // Secrets are never echoed back by the API: when editing and the secret
     // fields are left empty, the auth block is omitted so the stored
-    // authentication is preserved.
+    // authentication is preserved. The agent path is not a secret — an empty
+    // one is the documented "auto-detect" choice — so an agent form always
+    // submits its auth block; omitting it would make the PATCH a silent no-op
+    // that keeps the previous auth kind (#1910).
     const secretEmpty = form.authKind === 'password'
       ? form.password === ''
-      : form.keyPath.trim() === ''
+      : form.authKind === 'key'
+        ? form.keyPath.trim() === ''
+        : false
     const auth: HostPayload['auth'] = editing != null && secretEmpty
       ? undefined
       : form.authKind === 'password'
         ? { kind: 'password', password: form.password }
-        : { kind: 'key', keyPath: form.keyPath.trim(), passphrase: form.passphrase === '' ? undefined : form.passphrase }
+        : form.authKind === 'key'
+          ? { kind: 'key', keyPath: form.keyPath.trim(), passphrase: form.passphrase === '' ? undefined : form.passphrase }
+          : { kind: 'agent', agentPath: form.agentPath.trim() === '' ? undefined : form.agentPath.trim() }
     const payload: HostPayload = {
       host,
       port,
       user,
       auth,
       proxyJump: splitList(form.proxyJump),
+      // Always sent (never omitted): an empty value is the explicit clear,
+      // because the API cannot express "remove this field" any other way.
+      proxyCommand: form.proxyCommand.trim(),
+      // Always sent (never omitted): the flag is a plain boolean, so saving the
+      // form can both enable and clear forwarding (omitting it would keep the
+      // stored value under PATCH semantics).
+      forwardAgent: form.forwardAgent,
       description: form.description.trim() === '' ? undefined : form.description.trim(),
       environment: form.environment.trim() === '' ? undefined : form.environment.trim(),
       tags: splitList(form.tags),
@@ -163,6 +189,10 @@ export function HostFormDialog({ api, editing, onClose, onSaved }: HostFormDialo
               <input type="radio" name="dsh-ssh-auth" checked={form.authKind === 'password'} onChange={() => { set('authKind', 'password') }} />
               {tt('form.auth.password')}
             </label>
+            <label className={css.radioLabel}>
+              <input type="radio" name="dsh-ssh-auth" checked={form.authKind === 'agent'} onChange={() => { set('authKind', 'agent') }} />
+              {tt('form.auth.agent')}
+            </label>
           </div>
           {editing != null && <span className={css.hint}>{tt('form.authKeepHint')}</span>}
         </div>
@@ -178,6 +208,12 @@ export function HostFormDialog({ api, editing, onClose, onSaved }: HostFormDialo
               <input className={css.input} type="password" value={form.passphrase} onChange={event => { set('passphrase', event.target.value) }} />
             </label>
           </div>
+        ) : form.authKind === 'agent' ? (
+          <label className={css.field}>
+            <span className={css.fieldLabel}>{tt('form.agentPath')}</span>
+            <input className={css.input} value={form.agentPath} onChange={event => { set('agentPath', event.target.value) }} />
+            <span className={css.hint}>{tt('form.agentPathHint')}</span>
+          </label>
         ) : (
           <label className={css.field}>
             <span className={css.fieldLabel}>{tt('form.password')}</span>
@@ -189,6 +225,21 @@ export function HostFormDialog({ api, editing, onClose, onSaved }: HostFormDialo
           <span className={css.fieldLabel}>{tt('form.proxyJump')}</span>
           <input className={css.input} value={form.proxyJump} onChange={event => { set('proxyJump', event.target.value) }} />
           <span className={css.hint}>{tt('form.proxyJumpHint')}</span>
+        </label>
+        <label className={css.field}>
+          <span className={css.fieldLabel}>{tt('form.proxyCommand')}</span>
+          <input
+            className={css.input}
+            value={form.proxyCommand}
+            placeholder="corp-vpn proxy %h %p %r"
+            onChange={event => { set('proxyCommand', event.target.value) }}
+          />
+          <span className={css.hint}>{tt('form.proxyCommandHint')}</span>
+        </label>
+        <label className={css.field}>
+          <span className={css.fieldLabel}>{tt('form.forwardAgent')}</span>
+          <input type="checkbox" checked={form.forwardAgent} onChange={event => { set('forwardAgent', event.target.checked) }} />
+          <span className={css.hint}>{tt('form.forwardAgentHint')}</span>
         </label>
         <div className={css.formRow}>
           <label className={css.field}>

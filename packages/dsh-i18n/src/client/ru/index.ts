@@ -1,0 +1,50 @@
+/**
+ * Aggregator for the ru dictionaries: one module per source package under
+ * src/client/ru/. Files are named after the source package (stable even if a
+ * package renames its locale namespace); the mapping below owns the namespace
+ * ids the locale registry sees. scripts/i18n-audit.mjs loads this module to
+ * verify per-namespace coverage against every package's zh keys.
+ * @module @linxin666/dsh-i18n/client/ru
+ */
+import { ru as agents } from './agents.ts'
+import { ru as browserView } from './browser-view.ts'
+import { ru as liangshen } from './liangshen.ts'
+import { ru as market } from './market.ts'
+import { ru as messageEdit } from './message-edit.ts'
+import { ru as pet } from './pet.ts'
+import { ru as pluginManager } from './plugin-manager.ts'
+import { ru as presetCenter } from './preset-center.ts'
+import { ru as remoteBridge } from './remote-bridge.ts'
+import { ru as sessionId } from './session-id.ts'
+import { ru as sessionArchive } from './session-archive.ts'
+import { ru as skillExplorer } from './skill-explorer.ts'
+import { ru as ssh } from './ssh.ts'
+import { ru as taskBoard } from './task-board.ts'
+import { ru as taskBoardGithub } from './task-board-github.ts'
+import { ru as taskBoardTeam } from './task-board-team.ts'
+import { ru as usage } from './usage.ts'
+import { ru as webSettings } from './web-settings.ts'
+import { ru as workspaceTabs } from './workspace-tabs.ts'
+
+/** ru dictionaries keyed by the locale namespace each source package registers. */
+export const ruDictionaries: Record<string, Record<string, string>> = {
+  'dsh-agents': agents,
+  'browser-view': browserView,
+  'liangshen': liangshen,
+  'dsh-web-ui-market': market,
+  'message-edit': messageEdit,
+  'pet': pet,
+  'settings.pluginManager': pluginManager,
+  'dsh-web-ui-preset-center': presetCenter,
+  'remote-bridge': remoteBridge,
+  'session-id': sessionId,
+  'dsh-web-ui-session-archive': sessionArchive,
+  'dsh-skill-explorer': skillExplorer,
+  'dsh-ssh': ssh,
+  'task-board': taskBoard,
+  'task-board-github': taskBoardGithub,
+  'task-board-team': taskBoardTeam,
+  'dsh-web-ui-usage': usage,
+  'web-ui-plugins': webSettings,
+  'workspace-tabs': workspaceTabs,
+}
