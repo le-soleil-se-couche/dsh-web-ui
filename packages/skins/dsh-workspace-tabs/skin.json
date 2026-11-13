@@ -1,0 +1,26 @@
+{
+  "id": "dsh-workspace-tabs",
+  "name": "工作区标签栏",
+  "nameEn": "Workspace Tabs",
+  "author": "Ewin",
+  "tagline": "工作区与会话标签导航",
+  "description": "在同一个插件中提供浏览器式顶栏、紧凑顶栏和暖色外观；原生窗口拖动仅在 macOS 启用。",
+  "tags": [
+    "workspace",
+    "tabs",
+    "navigation",
+    "warm"
+  ],
+  "accent": "#DA7756",
+  "bodyAttr": "data-dsh-workspace-tabs",
+  "package": "@linxin666/dsh-client-ui-workspace-tabs",
+  "wiring": {
+    "id": "ui-skin-workspace-tabs",
+    "bundleWired": false
+  },
+  "preview": {
+    "light": "packages/skins/dsh-workspace-tabs/preview/light.png",
+    "dark": "packages/skins/dsh-workspace-tabs/preview/dark.png"
+  },
+  "order": 8
+}
