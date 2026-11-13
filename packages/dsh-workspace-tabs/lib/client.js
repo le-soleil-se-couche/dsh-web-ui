@@ -171,7 +171,7 @@ window.__ModuleLoader__.load({
 				return {
 					id: workspaceId,
 					workspaceId,
-					title: title || path.split(/[/\\]/).filter(Boolean).at(-1) || t("workspace.default"),
+					title: title || path.split(/[/\\]/).findLast(Boolean) || t("workspace.default"),
 					path,
 					sessions: members,
 					running: members.some((session) => session.running)
