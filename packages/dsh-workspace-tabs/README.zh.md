@@ -6,17 +6,18 @@
 
 ## 能力
 
-- 从顶栏切换工作区和会话。
+- 从顶栏切换工作区和主会话。子 Agent 从所属主会话打开。
+- 拖动同一工作区内的会话标签可以重排。右键标签或会话列表里的条目也可向前、向后移动。顶栏在当前浏览器保存各工作区的顺序。
 - 导航最近访问的会话、新建会话、切换侧栏，并通过“更多”打开扩展面板。
 - 在双行浏览器布局和紧凑经典布局之间切换。
-- 仅在宿主报告 macOS（`data-platform="darwin"`）时启用原生窗口拖动区域；按钮保持可点击。
+- 在 macOS 桌面版中，按住首行最右端的点阵握柄或红黄绿按钮右侧的空白，即可移动窗口。
 
 ## 安装
 
-需要 Node.js >=24.9 和 DeepSeek Harness >=0.2.2-rc.2。本 fork 基于上游 dsh-web v0.4.18。克隆本仓库，安装已声明的依赖并构建插件：
+需要 Node.js >=24.9 和 DeepSeek Harness >=0.2.2-rc.2。本 fork 基于上游 dsh-web v0.4.18。带有会话排序和 macOS 窗口拖动的版本从 `feat/workspace-tabs` 分支构建安装。
 
 ```sh
-git clone --branch main https://github.com/le-soleil-se-couche/dsh-web-ui.git
+git clone --branch feat/workspace-tabs https://github.com/le-soleil-se-couche/dsh-web-ui.git
 cd dsh-web-ui
 pnpm run deps:install
 pnpm --filter @linxin666/dsh-client-ui-workspace-tabs build

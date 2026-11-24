@@ -1,13 +1,13 @@
 /* Workspace Tabs skin — scoped under body[data-dsh-workspace-tabs].
-   Warm-cream paper surfaces, terracotta accent, warm-ink text, serif type.
+   Warm-cream paper surfaces, terracotta accent, warm-ink text, serif type (Claude Code Warm Terracotta).
    Dark variant: body[data-dsh-workspace-tabs][data-ds-dark-theme].
-   Chrome modes: default "browser" (Chrome-style workspace bookmark bar + conversation tabs + top-right extensions)
-   and toggleable "classic" (compact single-row titlebar). */
+   Layouts: default "browser" (conversation tabs over workspaces) and "classic" (single row). */
 
 body[data-dsh-workspace-tabs] {
   /* Appearance primitives */
-  --workspace-tabs-ui-font: var(--dsh-appearance-ui-font, "Source Han Serif SC VF", "Source Han Serif SC", serif);
-  --workspace-tabs-code-font: var(--dsh-appearance-code-font, "SF Mono", Consolas, "Courier New", monospace);
+  --workspace-tabs-ui-font: var(--dsh-appearance-ui-font, "思源宋体 VF", "Source Han Serif SC VF", "思源宋体", "Songti SC", serif);
+  --workspace-tabs-chrome-font: var(--dsh-appearance-ui-font, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif);
+  --workspace-tabs-code-font: var(--dsh-appearance-code-font, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace);
   --workspace-tabs-accent: var(--dsh-appearance-light-accent, #da7756);
   --workspace-tabs-canvas: var(--dsh-appearance-light-canvas, #f5f3ee);
   --workspace-tabs-surface: var(--dsh-appearance-light-surface, #f1eee8);
@@ -16,6 +16,7 @@ body[data-dsh-workspace-tabs] {
   /* deterministic derivatives */
   --workspace-tabs-brand-invert: var(--workspace-tabs-canvas);
   --workspace-tabs-brand-text: color-mix(in srgb, var(--workspace-tabs-accent) 72%, var(--workspace-tabs-foreground) 28%);
+  --workspace-tabs-warning: color-mix(in srgb, var(--workspace-tabs-accent) 82%, var(--workspace-tabs-foreground) 18%);
   --workspace-tabs-layer-2: color-mix(in srgb, var(--workspace-tabs-surface) 94%, var(--workspace-tabs-foreground) 6%);
   --workspace-tabs-layer-3: color-mix(in srgb, var(--workspace-tabs-surface) 90%, var(--workspace-tabs-foreground) 10%);
   --workspace-tabs-label-primary-dimmed: color-mix(in srgb, var(--workspace-tabs-foreground) 82%, var(--workspace-tabs-canvas) 18%);
@@ -32,6 +33,8 @@ body[data-dsh-workspace-tabs] {
   --workspace-tabs-accent-solid: color-mix(in srgb, var(--workspace-tabs-accent) 22%, transparent 78%);
   --workspace-tabs-raised: color-mix(in srgb, var(--workspace-tabs-canvas) 78%, var(--workspace-tabs-surface) 22%);
   --workspace-tabs-titlebar-surface: var(--workspace-tabs-canvas);
+  --workspace-tabs-code-surface: var(--workspace-tabs-surface);
+  --workspace-tabs-selection: color-mix(in srgb, var(--workspace-tabs-accent) 32%, transparent 68%);
 
   /* fonts */
   --dsw-font-family: var(--workspace-tabs-ui-font);
@@ -42,6 +45,11 @@ body[data-dsh-workspace-tabs] {
   --dsw-alias-brand-primary-invert: var(--workspace-tabs-brand-invert);
   --dsw-alias-brand-primary-new-colorprimary-new-color: var(--workspace-tabs-accent);
   --dsw-alias-brand-text: var(--workspace-tabs-brand-text);
+
+  /* semantic colors */
+  --dsw-alias-state-success-primary: #00c853;
+  --dsw-alias-state-error-primary: #ff5f38;
+  --dsw-alias-state-warn-primary: var(--workspace-tabs-warning);
 
   /* warm-cream background hierarchy */
   --dsw-alias-bg-base: var(--workspace-tabs-canvas);
@@ -81,8 +89,13 @@ body[data-dsh-workspace-tabs] {
   --dsw-alias-button-tool-bar-fill: var(--workspace-tabs-canvas);
   --dsw-alias-button-contrast-fill: var(--workspace-tabs-foreground);
 
-  /* DSH modal overlay offsets so native dialogs respect our chrome bar */
-  --workspace-tabs-height: 68px;
+  /* The Desktop window's 14px traffic lights start at y=18px. Center this row at y=25px. */
+  --workspace-tabs-tab-row: 50px;
+  --workspace-tabs-workspace-row: 42px;
+  --workspace-tabs-top-control: 36px;
+  --workspace-tabs-workspace-control: 34px;
+  --workspace-tabs-height: calc(var(--workspace-tabs-tab-row) + var(--workspace-tabs-workspace-row));
+  --workspace-tabs-drag-min: 0px;
   --workspace-tabs-caption: 0px;
   --dsh-frame-chrome-top: calc(var(--workspace-tabs-height) + var(--workspace-tabs-caption));
   --dsh-frame-overlay-top: var(--dsh-frame-chrome-top);
@@ -91,13 +104,16 @@ body[data-dsh-workspace-tabs] {
   color: var(--workspace-tabs-foreground);
   background-color: var(--workspace-tabs-canvas);
 
-  /* room for the fixed 2-row Chrome-style topbar (40px row1 + 28px row2) */
   padding-top: var(--workspace-tabs-height);
   box-sizing: border-box;
 }
 
 body[data-dsh-workspace-tabs][data-workspace-tabs-mode="classic"] {
-  --workspace-tabs-height: 40px;
+  --workspace-tabs-height: var(--workspace-tabs-tab-row);
+}
+
+:global(html[data-platform="darwin"]:not([data-fullscreen])) body[data-dsh-workspace-tabs] {
+  --workspace-tabs-drag-min: clamp(44px, 8vw, 128px);
 }
 
 :global(html[data-windows-titlebar]:not([data-fullscreen])) body[data-dsh-workspace-tabs] {
@@ -112,6 +128,7 @@ body[data-dsh-workspace-tabs][data-ds-dark-theme] {
   --workspace-tabs-foreground: var(--dsh-appearance-dark-foreground, #f5f3ee);
   --workspace-tabs-brand-invert: var(--workspace-tabs-canvas);
   --workspace-tabs-brand-text: color-mix(in srgb, var(--workspace-tabs-accent) 78%, var(--workspace-tabs-foreground) 22%);
+  --workspace-tabs-warning: color-mix(in srgb, var(--workspace-tabs-accent) 78%, var(--workspace-tabs-foreground) 22%);
   --workspace-tabs-layer-2: color-mix(in srgb, var(--workspace-tabs-surface) 94%, var(--workspace-tabs-foreground) 6%);
   --workspace-tabs-layer-3: color-mix(in srgb, var(--workspace-tabs-surface) 90%, var(--workspace-tabs-foreground) 10%);
   --workspace-tabs-label-primary-dimmed: color-mix(in srgb, var(--workspace-tabs-foreground) 84%, var(--workspace-tabs-canvas) 16%);
@@ -128,6 +145,14 @@ body[data-dsh-workspace-tabs][data-ds-dark-theme] {
   --workspace-tabs-accent-solid: color-mix(in srgb, var(--workspace-tabs-accent) 28%, transparent 72%);
   --workspace-tabs-raised: color-mix(in srgb, var(--workspace-tabs-canvas) 62%, var(--workspace-tabs-surface) 38%);
   --workspace-tabs-titlebar-surface: var(--workspace-tabs-surface);
+  --workspace-tabs-code-surface: color-mix(in srgb, var(--workspace-tabs-canvas) 88%, var(--workspace-tabs-surface) 12%);
+  --workspace-tabs-scrollbar-thumb: color-mix(in srgb, var(--workspace-tabs-surface) 78%, var(--workspace-tabs-foreground) 22%);
+  --workspace-tabs-scrollbar-thumb-hover: color-mix(in srgb, var(--workspace-tabs-surface) 66%, var(--workspace-tabs-foreground) 34%);
+  --workspace-tabs-selection: color-mix(in srgb, var(--workspace-tabs-accent) 32%, transparent 68%);
+
+  --dsw-alias-state-success-primary: #3ddc72;
+  --dsw-alias-state-error-primary: #ff7a55;
+  --dsw-alias-state-warn-primary: var(--workspace-tabs-warning);
 }
 
 /* The macOS sidebar toggle sits in the native caption strip above the brand row. */
@@ -144,15 +169,18 @@ body[data-dsh-workspace-tabs] [data-shell-leading] {
   display: none !important;
 }
 
-/* macOS Electron draggable region rules (buttons, tabs, chips, inputs stay no-drag) */
-:global(html[data-platform="darwin"]) body[data-dsh-workspace-tabs]:not([data-window-drag-recall]) .titlebar[data-window-drag],
-:global(html[data-platform="darwin"]) body[data-dsh-workspace-tabs]:not([data-window-drag-recall]) .titlebar [data-window-drag] {
+/* Only the grips contribute drag rectangles. Exclude controls at their clipped
+   container bounds so off-screen tabs cannot subtract adjacent drag space. */
+:global(html[data-platform="darwin"]) body[data-dsh-workspace-tabs] > .titlebar,
+body[data-dsh-workspace-tabs] .windowGrip {
+  -webkit-app-region: initial !important;
+}
+
+:global(html[data-platform="darwin"]:not([data-fullscreen])) body[data-dsh-workspace-tabs]:not([data-window-drag-recall]) .windowGrip {
   -webkit-app-region: drag !important;
 }
 
 :global(html[data-platform="darwin"]) body[data-dsh-workspace-tabs] .titlebar [data-no-drag],
-:global(html[data-platform="darwin"]) body[data-dsh-workspace-tabs] .titlebar button,
-:global(html[data-platform="darwin"]) body[data-dsh-workspace-tabs] .titlebar input,
 :global(html[data-platform="darwin"]) body[data-dsh-workspace-tabs] .dropdown {
   -webkit-app-region: no-drag !important;
 }
@@ -168,10 +196,11 @@ body[data-dsh-workspace-tabs] .titlebar {
   flex-direction: column;
   height: var(--workspace-tabs-height);
   background: var(--workspace-tabs-titlebar-surface);
-  border-bottom: 1px solid var(--workspace-tabs-border-l1);
+  box-shadow: 0 1px 0 var(--workspace-tabs-border-l1);
   color: var(--workspace-tabs-foreground);
-  font-family: var(--workspace-tabs-ui-font);
-  font-size: 12px;
+  font-family: var(--workspace-tabs-chrome-font);
+  font-size: 15px;
+  line-height: 1.35;
   user-select: none;
   box-sizing: border-box;
 }
@@ -179,29 +208,29 @@ body[data-dsh-workspace-tabs] .titlebar {
 body[data-dsh-workspace-tabs] .row1 {
   display: flex;
   align-items: center;
-  height: 40px;
-  min-height: 40px;
-  padding: 0 10px;
-  gap: 6px;
+  flex: none;
+  height: var(--workspace-tabs-tab-row);
+  padding: 0 14px;
+  gap: 12px;
   box-sizing: border-box;
   position: relative;
 }
 
 :global(html[data-platform="darwin"]:not([data-fullscreen])) body[data-dsh-workspace-tabs] .row1 {
-  padding-left: 84px;
+  /* The green control ends at x=76px. Keep a 28px gap before the toolbar. */
+  padding-left: 104px;
 }
 
 body[data-dsh-workspace-tabs] .row2 {
   display: flex;
   align-items: center;
-  height: 28px;
-  min-height: 28px;
-  padding: 0 10px;
-  gap: 4px;
+  flex: none;
+  height: var(--workspace-tabs-workspace-row);
+  padding: 0 14px;
+  gap: 10px;
   box-sizing: border-box;
-  background: color-mix(in srgb, var(--workspace-tabs-canvas) 65%, var(--workspace-tabs-surface) 35%);
-  border-top: 1px solid color-mix(in srgb, var(--workspace-tabs-border-l1) 60%, transparent 40%);
-  font-size: 12px;
+  background: var(--workspace-tabs-canvas);
+  border-top: 1px solid color-mix(in srgb, var(--workspace-tabs-border-l1) 62%, transparent);
 }
 
 body[data-dsh-workspace-tabs][data-workspace-tabs-mode="classic"] .row2 {
@@ -211,27 +240,47 @@ body[data-dsh-workspace-tabs][data-workspace-tabs-mode="classic"] .row2 {
 body[data-dsh-workspace-tabs] .navGroup {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
+  gap: 4px;
   flex: none;
+}
+
+body[data-dsh-workspace-tabs] .row2 .navGroup {
+  margin-inline-start: auto;
 }
 
 body[data-dsh-workspace-tabs] .iconBtn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  height: 26px;
-  min-width: 26px;
-  padding: 0 7px;
-  border-radius: 6px;
+  height: var(--workspace-tabs-top-control);
+  min-width: var(--workspace-tabs-top-control);
+  box-sizing: border-box;
+  padding: 0 8px;
+  border-radius: 8px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--workspace-tabs-label-primary-dimmed);
   font-family: inherit;
-  font-size: 12px;
+  font-size: 15px;
+  line-height: 1;
   cursor: pointer;
-  gap: 4px;
+  gap: 5px;
   transition: background 0.12s, color 0.12s, border-color 0.12s;
   white-space: nowrap;
+}
+
+body[data-dsh-workspace-tabs] .row1 .navGroup .iconBtn {
+  width: var(--workspace-tabs-top-control);
+  padding: 0;
+}
+
+body[data-dsh-workspace-tabs] .row2 .iconBtn {
+  height: var(--workspace-tabs-workspace-control);
+}
+
+body[data-dsh-workspace-tabs] .titlebar button:focus-visible {
+  outline: 2px solid var(--workspace-tabs-accent);
+  outline-offset: -2px;
 }
 
 body[data-dsh-workspace-tabs] .iconBtn:hover {
@@ -252,48 +301,51 @@ body[data-dsh-workspace-tabs] .iconBtn:disabled {
   pointer-events: none;
 }
 
-/* Chrome-style conversation tab strip (belongs to selected workspace) */
+/* Conversations in the selected workspace */
 body[data-dsh-workspace-tabs] .tabStripWrap {
   display: flex;
   align-items: center;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   height: 100%;
-  gap: 4px;
+  gap: 6px;
   overflow: hidden;
 }
 
 body[data-dsh-workspace-tabs] .tabStrip {
   display: flex;
-  align-items: flex-end;
-  gap: 3px;
+  align-items: center;
+  gap: 6px;
   height: 100%;
+  min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
-  padding-top: 6px;
   box-sizing: border-box;
-  max-width: 100%;
 }
 
 body[data-dsh-workspace-tabs] .tabStrip::-webkit-scrollbar {
   display: none;
 }
 
+body[data-dsh-workspace-tabs] .tabStripWrap > .iconBtn {
+  flex: none;
+}
+
 body[data-dsh-workspace-tabs] .tab {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 32px;
-  max-width: 200px;
-  min-width: 84px;
-  padding: 0 10px;
-  border-radius: 8px 8px 0 0;
-  border: 1px solid transparent;
-  border-bottom: none;
-  background: color-mix(in srgb, var(--workspace-tabs-surface) 75%, transparent 25%);
-  color: var(--workspace-tabs-label-dimmed);
+  gap: 8px;
+  height: var(--workspace-tabs-top-control);
+  max-width: 240px;
+  min-width: 112px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--workspace-tabs-border-l1) 36%, transparent);
+  background: color-mix(in srgb, var(--workspace-tabs-canvas) 58%, transparent);
+  color: var(--workspace-tabs-label-primary-dimmed);
   font-family: inherit;
-  font-size: 12px;
+  font-size: 16px;
+  font-weight: 500;
   cursor: pointer;
   flex: 0 1 auto;
   transition: background 0.12s, color 0.12s;
@@ -307,6 +359,7 @@ body[data-dsh-workspace-tabs] .tab:hover {
 }
 
 body[data-dsh-workspace-tabs] .tab[data-active="true"] {
+  min-width: 148px;
   background: var(--workspace-tabs-canvas);
   color: var(--workspace-tabs-foreground);
   border-color: var(--workspace-tabs-border-l1);
@@ -319,6 +372,7 @@ body[data-dsh-workspace-tabs] .tabTitle {
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1 1 auto;
+  min-width: 0;
   text-align: left;
 }
 
@@ -339,10 +393,74 @@ body[data-dsh-workspace-tabs] .dot[data-active="true"]:not([data-running="true"]
   background: var(--workspace-tabs-accent);
 }
 
+body[data-dsh-workspace-tabs] .windowGrip {
+  display: none;
+}
+
+:global(html[data-platform="darwin"]:not([data-fullscreen])) body[data-dsh-workspace-tabs] .windowGrip {
+  display: grid;
+  place-items: center;
+}
+
+body[data-dsh-workspace-tabs] .captionGrip {
+  position: absolute;
+  inset: 4px auto 4px 76px;
+  width: 28px;
+}
+
 body[data-dsh-workspace-tabs] .dragSpacer {
-  flex: 1 1 24px;
-  height: 100%;
-  min-width: 24px;
+  flex: 1 0 var(--workspace-tabs-drag-min);
+  align-self: stretch;
+}
+
+body[data-dsh-workspace-tabs] .row1 .dragSpacer::after {
+  content: "";
+  width: 16px;
+  height: 8px;
+  justify-self: end;
+  margin-inline-end: 4px;
+  color: var(--workspace-tabs-label-caption);
+  background: radial-gradient(circle, currentColor 1px, transparent 1.2px) 0 0 / 4px 4px;
+}
+
+body[data-dsh-workspace-tabs] :is(.tab, .ddItem)[draggable="true"] {
+  cursor: grab;
+}
+
+body[data-dsh-workspace-tabs] :is(.tab, .ddItem)[data-tab-dragging] {
+  opacity: 0.55;
+}
+
+body[data-dsh-workspace-tabs] :is(.tab, .ddItem)[data-tab-drop] {
+  position: relative;
+}
+
+body[data-dsh-workspace-tabs] :is(.tab, .ddItem)[data-tab-drop]::after {
+  content: "";
+  position: absolute;
+  background: var(--workspace-tabs-accent);
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+body[data-dsh-workspace-tabs] .tab[data-tab-drop]::after {
+  inset-block: 4px;
+  width: 2px;
+}
+
+body[data-dsh-workspace-tabs] .tab[data-tab-drop="before"]::after { inset-inline-start: 1px; }
+body[data-dsh-workspace-tabs] .tab[data-tab-drop="after"]::after { inset-inline-end: 1px; }
+
+body[data-dsh-workspace-tabs] .ddItem[data-tab-drop]::after {
+  inset-inline: 6px;
+  height: 2px;
+}
+
+body[data-dsh-workspace-tabs] .ddItem[data-tab-drop="before"]::after { inset-block-start: 0; }
+body[data-dsh-workspace-tabs] .ddItem[data-tab-drop="after"]::after { inset-block-end: 0; }
+
+body[data-dsh-workspace-tabs][data-workspace-tabs-mode="classic"] .dragSpacer {
+  flex-grow: 0;
 }
 
 /* Classic Mac mode centered workspace/conversation switcher */
@@ -368,14 +486,16 @@ body[data-dsh-workspace-tabs] .classicPill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  max-width: 460px;
-  padding: 4px 12px;
+  max-width: min(100%, 460px);
+  height: var(--workspace-tabs-top-control);
+  box-sizing: border-box;
+  padding: 0 10px;
   border-radius: 7px;
   background: color-mix(in srgb, var(--workspace-tabs-surface) 82%, var(--workspace-tabs-foreground) 4%);
   border: 1px solid var(--workspace-tabs-border-l1);
   color: var(--workspace-tabs-foreground);
   font-family: inherit;
-  font-size: 12px;
+  font-size: 16px;
   cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -403,14 +523,18 @@ body[data-dsh-workspace-tabs] .classicSes {
   white-space: nowrap;
 }
 
-/* Top-Right Chrome Extension Toolbar (Plugins & Tools) */
+/* Global actions */
 body[data-dsh-workspace-tabs] .extBar {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
+  gap: 5px;
   flex: none;
-  padding-left: 6px;
+  padding-left: 8px;
   border-left: 1px solid var(--workspace-tabs-border-l1);
+}
+
+body[data-dsh-workspace-tabs] .row1 .extBar {
+  margin-inline-start: auto;
 }
 
 body[data-dsh-workspace-tabs] .divider {
@@ -431,7 +555,7 @@ body[data-dsh-workspace-tabs] .compactLabel {
   display: none;
 }
 
-@media (max-width: 760px) {
+@media (max-width: 1100px) {
   body[data-dsh-workspace-tabs] .extBar {
     flex: 0 1 auto;
     min-width: 0;
@@ -451,16 +575,17 @@ body[data-dsh-workspace-tabs] .compactLabel {
     padding-inline: 4px;
   }
 
-  body[data-dsh-workspace-tabs] .dragSpacer {
-    min-width: 0;
+  body[data-dsh-workspace-tabs] .row1,
+  body[data-dsh-workspace-tabs] .row2 {
+    gap: 4px;
   }
 }
 
-/* Row 2 Workspace Bookmark Bar */
+/* Workspaces */
 body[data-dsh-workspace-tabs] .wsBar {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 8px;
   flex: 0 1 auto;
   min-width: 0;
   overflow-x: auto;
@@ -475,12 +600,13 @@ body[data-dsh-workspace-tabs] .wsBar::-webkit-scrollbar {
 body[data-dsh-workspace-tabs] .wsChip {
   display: inline-flex;
   align-items: center;
-  height: 22px;
-  border-radius: 5px;
+  height: var(--workspace-tabs-workspace-control);
+  box-sizing: border-box;
+  border-radius: 8px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--workspace-tabs-label-primary-dimmed);
-  font-size: 12px;
+  font-size: 15px;
   flex: none;
   transition: background 0.12s, border-color 0.12s, color 0.12s;
   overflow: hidden;
@@ -501,8 +627,8 @@ body[data-dsh-workspace-tabs] .wsChip[data-active="true"] {
 body[data-dsh-workspace-tabs] .wsMain {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 0 6px 0 7px;
+  gap: 8px;
+  padding: 0 10px 0 12px;
   height: 100%;
   border: none;
   background: transparent;
@@ -515,13 +641,14 @@ body[data-dsh-workspace-tabs] .wsCaret {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
+  width: 25px;
   height: 100%;
+  padding: 0;
   border: none;
   border-left: 1px solid color-mix(in srgb, var(--workspace-tabs-border-l1) 50%, transparent 50%);
   background: transparent;
   color: inherit;
-  font-size: 10px;
+  font-size: 13px;
   cursor: pointer;
   opacity: 0.75;
 }
@@ -532,9 +659,10 @@ body[data-dsh-workspace-tabs] .wsCaret:hover {
 }
 
 body[data-dsh-workspace-tabs] .wsCount {
-  font-size: 10px;
-  opacity: 0.72;
-  padding: 0 4px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.82;
+  padding: 1px 5px;
   border-radius: 4px;
   background: color-mix(in srgb, var(--workspace-tabs-foreground) 8%, transparent 92%);
 }
@@ -552,9 +680,9 @@ body[data-dsh-workspace-tabs] .dropdown {
   border-radius: 10px;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
   padding: 6px;
-  font-family: var(--workspace-tabs-ui-font);
+  font-family: var(--workspace-tabs-chrome-font);
   color: var(--workspace-tabs-foreground);
-  font-size: 12px;
+  font-size: 14px;
 }
 
 body[data-dsh-workspace-tabs] .ddHeader {
@@ -578,7 +706,7 @@ body[data-dsh-workspace-tabs] .ddSearch {
   background: var(--workspace-tabs-surface);
   color: var(--workspace-tabs-foreground);
   font-family: inherit;
-  font-size: 12px;
+  font-size: 13px;
   outline: none;
 }
 
@@ -629,4 +757,41 @@ body[data-dsh-workspace-tabs] .ddEmpty {
   padding: 12px 8px;
   text-align: center;
   color: var(--workspace-tabs-label-caption);
+}
+
+/* SF Mono for code surfaces */
+body[data-dsh-workspace-tabs] pre,
+body[data-dsh-workspace-tabs] code,
+body[data-dsh-workspace-tabs] kbd {
+  font-family: var(--workspace-tabs-code-font);
+}
+
+body[data-dsh-workspace-tabs] pre {
+  background: var(--workspace-tabs-code-surface);
+  border: 1px solid var(--workspace-tabs-border-l1);
+  border-radius: 6px;
+}
+
+/* terracotta selection */
+body[data-dsh-workspace-tabs] ::selection {
+  background: var(--workspace-tabs-selection);
+}
+
+/* warm scrollbars for the dark terminal feel */
+body[data-dsh-workspace-tabs][data-ds-dark-theme] ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+body[data-dsh-workspace-tabs][data-ds-dark-theme] ::-webkit-scrollbar-thumb {
+  background: var(--workspace-tabs-scrollbar-thumb);
+  border-radius: 5px;
+}
+
+body[data-dsh-workspace-tabs][data-ds-dark-theme] ::-webkit-scrollbar-thumb:hover {
+  background: var(--workspace-tabs-scrollbar-thumb-hover);
+}
+
+body[data-dsh-workspace-tabs][data-ds-dark-theme] ::-webkit-scrollbar-track {
+  background: var(--workspace-tabs-canvas);
 }

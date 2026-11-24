@@ -6,17 +6,18 @@ Workspace Tabs adds workspace and conversation tabs, browser-style navigation, a
 
 ## What it does
 
-- Switch between workspaces and conversations from the top bar.
+- Switch between workspaces and main conversations from the top bar. Open subagents from their parent conversation.
+- Drag conversations within the same workspace to reorder them. The tab and conversation-list context menus also offer Move earlier and Move later. The bar saves each workspace's order in this browser.
 - Navigate recent conversations, create a conversation, toggle the sidebar, and open extension panels through More.
 - Switch between a two-row browser layout and a compact classic layout.
-- Use native window drag regions only when the host reports macOS (`data-platform="darwin"`); buttons remain clickable.
+- In the macOS desktop app, drag the dotted grip at the right end of the first row or the gap beside the red, yellow, and green window buttons to move the window.
 
 ## Install
 
-Requires Node.js >=24.9 and DeepSeek Harness >=0.2.2-rc.2. This fork is based on upstream dsh-web v0.4.18. Clone this repository, install its declared dependencies, and build the package:
+Requires Node.js >=24.9 and DeepSeek Harness >=0.2.2-rc.2. This fork is based on upstream dsh-web v0.4.18. Use the `feat/workspace-tabs` branch for the build with the conversation ordering and macOS window controls.
 
 ```sh
-git clone --branch main https://github.com/le-soleil-se-couche/dsh-web-ui.git
+git clone --branch feat/workspace-tabs https://github.com/le-soleil-se-couche/dsh-web-ui.git
 cd dsh-web-ui
 pnpm run deps:install
 pnpm --filter @linxin666/dsh-client-ui-workspace-tabs build

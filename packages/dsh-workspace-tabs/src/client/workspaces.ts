@@ -26,7 +26,19 @@ export function mainSession(sessions: SessionListState): SessionSummary | undefi
   return Object.values(sessions.byId).find(row => (row?.retainedBy.mainView ?? 0) > 0)
 }
 
-/** Combine the host workspace registry and session list without exposing archived or unused blank rows. */
+/** Resolve the owning conversation while keeping ordinary session forks independent. */
+export function topLevelSession(sessions: SessionListState, current: SessionSummary | undefined): SessionSummary | undefined {
+  const visited = new Set<SessionSummary['id']>()
+  while (current?.origin === 'subagent') {
+    const parent = current.parentId
+    if (!parent || visited.has(parent)) return undefined
+    visited.add(current.id)
+    current = sessions.byId[parent]
+  }
+  return current
+}
+
+/** Project the same ordinary sessions that the host workspace sidebar lists by default. */
 export function buildWorkspaceGroups(
   workspaces: WorkspaceSnapshot,
   sessions: SessionListState,
@@ -37,7 +49,8 @@ export function buildWorkspaceGroups(
   const claimed = new Set<SessionSummary['id']>()
   const visible = (id: SessionSummary['id']): SessionSummary[] => {
     const session = sessions.byId[id]
-    return session && !archived.has(id) && (!session.blank || id === active?.id) ? [session] : []
+    if (!session || session.origin === 'subagent' || archived.has(id)) return []
+    return !session.blank || id === active?.id ? [session] : []
   }
   const sortRecent = (a: SessionSummary, b: SessionSummary) => b.updatedAt - a.updatedAt
   const groups: WorkspaceGroup[] = workspaces.items.map(({ workspaceId, title, path, sessionIds }) => {
@@ -53,7 +66,7 @@ export function buildWorkspaceGroups(
     }
   })
 
-  // The selected session can be a retained row outside the host catalog (for example a subagent).
+  // A selected blank conversation can be retained before the host catalog gets its row.
   const allIds = new Set(sessions.ids)
   if (active) allIds.add(active.id)
   const members = [...allIds].filter(id => !claimed.has(id)).flatMap(visible).sort(sortRecent)

@@ -10,7 +10,8 @@ import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 import { en, NS, zh } from './locales.ts'
 import { actionSlots, panelEntries, panelSlots, shellActions } from './shell.ts'
-import { buildWorkspaceGroups, cleanSessionTitle, mainSession, relativeTime, type WorkspaceGroup } from './workspaces.ts'
+import { createTabDrag, movedTabOrder, orderTabs, readTabOrders } from './tab-order.ts'
+import { buildWorkspaceGroups, cleanSessionTitle, mainSession, relativeTime, topLevelSession, type WorkspaceGroup } from './workspaces.ts'
 import css from './workspace-tabs.module.css'
 
 export const inject = ['locale', 'workspaces', 'sessions', 'uiWorkspace', 'layout', 'slots']
@@ -19,6 +20,7 @@ type ChromeMode = 'browser' | 'classic'
 
 const MODE_STORAGE_KEY = 'dsh-workspace-tabs:chrome-mode'
 const WS_STORAGE_KEY = 'dsh-workspace-tabs:selected-workspace'
+const TAB_ORDER_STORAGE_KEY = 'dsh-workspace-tabs:tab-order'
 const DEFAULT_APP_TITLE = 'DeepSeek Harness'
 const MAX_VISIBLE_TABS = 12
 
@@ -40,8 +42,26 @@ function writeStorage(key: string, val: string): void {
   }
 }
 
+function navigationGlyph(outline: string): SVGSVGElement {
+  const ns = 'http://www.w3.org/2000/svg'
+  const icon = document.createElementNS(ns, 'svg')
+  icon.setAttribute('viewBox', '0 0 16 16')
+  icon.setAttribute('width', '16')
+  icon.setAttribute('height', '16')
+  icon.setAttribute('fill', 'none')
+  icon.setAttribute('aria-hidden', 'true')
+  const path = document.createElementNS(ns, 'path')
+  path.setAttribute('d', outline)
+  path.setAttribute('stroke', 'currentColor')
+  path.setAttribute('stroke-width', '1.5')
+  path.setAttribute('stroke-linecap', 'round')
+  path.setAttribute('stroke-linejoin', 'round')
+  icon.append(path)
+  return icon
+}
+
 function makeIconButton(
-  label: string,
+  label: string | SVGSVGElement,
   tooltip: string,
   opts: { active?: boolean; disabled?: boolean; extraClass?: string; compactLabel?: string; onClick: (e: MouseEvent) => void },
 ): HTMLButtonElement {
@@ -52,7 +72,9 @@ function makeIconButton(
   if (opts.disabled) btn.disabled = true
   btn.title = tooltip
   btn.setAttribute('aria-label', tooltip)
-  if (opts.compactLabel) {
+  if (typeof label !== 'string') {
+    btn.append(label)
+  } else if (opts.compactLabel) {
     const full = document.createElement('span')
     full.className = cls('fullLabel')
     full.textContent = label
@@ -79,20 +101,30 @@ function mount(ctx: Context): () => void {
   const actions = shellActions(ctx)
   const body = document.body
   const isMacOS = document.documentElement.dataset.platform === 'darwin'
-  const markWindowRegion = (element: HTMLElement, draggable: boolean): void => {
-    if (isMacOS) element.setAttribute(draggable ? 'data-window-drag' : 'data-no-drag', 'true')
+  const excludeFromWindowDrag = (element: HTMLElement): void => {
+    if (isMacOS) element.setAttribute('data-no-drag', 'true')
+  }
+  const makeWindowGrip = (position: 'dragSpacer' | 'captionGrip'): HTMLElement => {
+    const grip = document.createElement('div')
+    grip.className = `${cls('windowGrip')} ${cls(position)}`
+    grip.setAttribute('aria-hidden', 'true')
+    grip.setAttribute('data-window-drag', 'true')
+    return grip
   }
   const originalTitle = document.title
   let lastSkinTitle: string | null = null
 
   let mode: ChromeMode = readStorage(MODE_STORAGE_KEY) === 'classic' ? 'classic' : 'browser'
   let selectedWorkspaceId: string | null = readStorage(WS_STORAGE_KEY) || null
+  let tabOrders = readTabOrders(readStorage(TAB_ORDER_STORAGE_KEY))
+  let renderedGroups: WorkspaceGroup[] = []
   const sessionHistory: SessionSummary['id'][] = []
   let historyIndex = -1
   let lastActiveSessionId: SessionSummary['id'] | null = null
   let activeDropdown: HTMLElement | null = null
   let activeAnchor: HTMLElement | null = null
   let lastRenderKey = ''
+  let renderedWorkspaceId: string | null = null
 
   const closeDropdown = (): void => {
     if (activeDropdown) {
@@ -109,15 +141,23 @@ function mount(ctx: Context): () => void {
   titlebar.className = cls('titlebar')
   titlebar.dataset.skinChrome = 'titlebar'
   titlebar.dataset.dshPlugin = 'workspace-tabs'
-  markWindowRegion(titlebar, true)
 
   const row1 = document.createElement('div')
   row1.className = cls('row1')
-  markWindowRegion(row1, true)
 
   const row2 = document.createElement('div')
   row2.className = cls('row2')
-  markWindowRegion(row2, true)
+
+  const captionGrip = isMacOS ? makeWindowGrip('captionGrip') : null
+  const conversationGrip = isMacOS ? makeWindowGrip('dragSpacer') : null
+  const workspaceGrip = isMacOS ? makeWindowGrip('dragSpacer') : null
+
+  const tabStrip = document.createElement('div')
+  tabStrip.className = cls('tabStrip')
+
+  const wsBar = document.createElement('div')
+  wsBar.className = cls('wsBar')
+  excludeFromWindowDrag(wsBar)
 
   titlebar.append(row1, row2)
   body.append(titlebar)
@@ -143,26 +183,83 @@ function mount(ctx: Context): () => void {
     render()
   }
 
+  const moveTab = (
+    workspace: string, source: SessionSummary['id'], target: SessionSummary['id'], side: 'before' | 'after',
+  ): void => {
+    const group = renderedGroups.find(row => row.id === workspace)
+    if (!group) return
+    const stored = readStorage(TAB_ORDER_STORAGE_KEY)
+    const orders = stored === null ? tabOrders : readTabOrders(stored)
+    const saved = orders.get(workspace)
+    const next = movedTabOrder(orderTabs(group.sessions, saved), saved, source, target, side)
+    if (!next) return
+    orders.set(workspace, next)
+    tabOrders = orders
+    writeStorage(TAB_ORDER_STORAGE_KEY, JSON.stringify(Object.fromEntries(tabOrders)))
+    closeDropdown()
+    render()
+  }
+  const tabDrag = createTabDrag(moveTab)
+
   const createAnchoredDropdown = (anchorEl: HTMLElement, anchorId: string, alignRight = false): HTMLDivElement | null => {
     if (activeDropdown && activeAnchor === anchorEl && activeDropdown.dataset.anchorId === anchorId) {
       closeDropdown()
       return null
     }
-    closeDropdown()
     const rect = anchorEl.getBoundingClientRect()
+    closeDropdown()
     const dd = document.createElement('div')
     dd.className = cls('dropdown')
     dd.dataset.skinChrome = 'dropdown'
     dd.dataset.anchorId = anchorId
     dd.dataset.dshPlugin = 'workspace-tabs'
     activeAnchor = anchorEl
-    markWindowRegion(dd, false)
+    excludeFromWindowDrag(dd)
     const top = Math.min(window.innerHeight - 80, Math.round(rect.bottom + 4))
     const rawLeft = alignRight ? rect.right - 260 : rect.left
     const left = Math.max(8, Math.min(window.innerWidth - 320, Math.round(rawLeft)))
     dd.style.top = `${top}px`
     dd.style.left = `${left}px`
     return dd
+  }
+
+  const bindTabArrangement = (
+    button: HTMLButtonElement, session: SessionSummary, group: WorkspaceGroup, axis: 'x' | 'y',
+  ): void => {
+    if (session.blank || !group.sessions.some(row => row.id !== session.id && !row.blank)) return
+    tabDrag.bind(button, group.id, session.id, axis)
+    const open = (event: Event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      const tabs = group.sessions.filter(row => !row.blank)
+      const index = tabs.findIndex(row => row.id === session.id)
+      const dd = createAnchoredDropdown(button, `tab-order:${session.id}`)
+      if (!dd) return
+      for (const [key, peer, side] of [
+        ['session.moveEarlier', tabs[index - 1], 'before'],
+        ['session.moveLater', tabs[index + 1], 'after'],
+      ] as const) {
+        const item = document.createElement('button')
+        item.className = cls('ddItem')
+        item.type = 'button'
+        item.textContent = t(key)
+        item.disabled = !peer
+        item.onclick = () => { if (peer) moveTab(group.id, session.id, peer.id, side) }
+        dd.append(item)
+      }
+      dd.onkeydown = event => {
+        if (event.key !== 'Escape') return
+        closeDropdown()
+        if (button.isConnected) button.focus()
+      }
+      body.append(dd)
+      activeDropdown = dd
+      dd.querySelector<HTMLButtonElement>('button:enabled')?.focus()
+    }
+    button.oncontextmenu = open
+    button.onkeydown = event => {
+      if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) open(event)
+    }
   }
 
   const openSessionsDropdown = (
@@ -240,6 +337,7 @@ function mount(ctx: Context): () => void {
           writeStorage(WS_STORAGE_KEY, selectedWorkspaceId)
           openSessionById(s.id)
         }
+        bindTabArrangement(item, s, owner, 'y')
         listWrap.append(item)
       }
     }
@@ -319,10 +417,13 @@ function mount(ctx: Context): () => void {
     const workspaceSnapshot = workspaces.list.getSnapshot()
     const sessionSnapshot = sessions.list.getSnapshot()
     const { activePanelId } = layout.panelInfo.getSnapshot()
-    const activeSession = mainSession(sessionSnapshot)
+    const viewedSession = mainSession(sessionSnapshot)
+    const activeSession = topLevelSession(sessionSnapshot, viewedSession)
     const activeSessionId = activeSession?.id ?? null
     const panels = panelEntries(slots)
     const groups = buildWorkspaceGroups(workspaceSnapshot, sessionSnapshot, activeSession, t)
+      .map(group => ({ ...group, sessions: orderTabs(group.sessions, tabOrders.get(group.id)) }))
+    renderedGroups = groups
     const groupWithActiveSession = groups.find(group => group.sessions.some(session => session.id === activeSessionId))
 
     if (activeSessionId !== lastActiveSessionId) {
@@ -332,7 +433,9 @@ function mount(ctx: Context): () => void {
           sessionHistory.push(activeSessionId)
           historyIndex = sessionHistory.length - 1
         }
-        if (lastActiveSessionId && groupWithActiveSession) selectedWorkspaceId = groupWithActiveSession.id
+        if (groupWithActiveSession && (lastActiveSessionId || viewedSession?.origin === 'subagent')) {
+          selectedWorkspaceId = groupWithActiveSession.id
+        }
       }
       lastActiveSessionId = activeSessionId
     }
@@ -354,7 +457,7 @@ function mount(ctx: Context): () => void {
     const { settingsAvailable, usageAvailable, remoteAvailable } = actions
     const localeRevision = locale.getSnapshot().revision
 
-    updateWindowTitle(Boolean(activeSession), activeWsTitle, activeSessionTitle)
+    updateWindowTitle(Boolean(viewedSession), activeWsTitle, viewedSession ? sessionTitle(viewedSession) : activeSessionTitle)
 
     const visibleTabs = currentGroup.sessions.slice(0, MAX_VISIBLE_TABS)
     const canBack = historyIndex > 0
@@ -378,35 +481,39 @@ function mount(ctx: Context): () => void {
     if (nextRenderKey === lastRenderKey) return
     lastRenderKey = nextRenderKey
 
-    // --- Row 1: Navigation + Chrome Tab Strip (or Classic Mac pill) + Top-Right Extension Bar ---
+    // Keep a scrolled tab or workspace visible when switching it redraws the bar.
+    const tabScrollLeft = renderedWorkspaceId === currentGroup.id ? tabStrip.scrollLeft : 0
+    const workspaceScrollLeft = wsBar.scrollLeft
+    renderedWorkspaceId = currentGroup.id
+
+    // Row 1: Navigation and conversations.
+    tabDrag.reset()
     row1.replaceChildren()
 
     const navGroup = document.createElement('div')
     navGroup.className = cls('navGroup')
-    markWindowRegion(navGroup, false)
+    excludeFromWindowDrag(navGroup)
 
     navGroup.append(
-      makeIconButton('◧', t('chrome.sidebar'), { onClick: () => layout.toggleSidebar() }),
-      makeIconButton('←', t('session.back'), {
+      makeIconButton(navigationGlyph('M3 2.75h10a1 1 0 0 1 1 1v8.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-8.5a1 1 0 0 1 1-1ZM6 2.75v10.5'), t('chrome.sidebar'), {
+        onClick: () => layout.toggleSidebar(),
+      }),
+      makeIconButton(navigationGlyph('M13.75 8H2.25m4.25-4.25L2.25 8l4.25 4.25'), t('session.back'), {
         disabled: !canBack,
         onClick: () => moveInHistory(-1),
       }),
-      makeIconButton('→', t('session.forward'), {
+      makeIconButton(navigationGlyph('M2.25 8h11.5M9.5 3.75 13.75 8 9.5 12.25'), t('session.forward'), {
         disabled: !canFwd,
         onClick: () => moveInHistory(1),
       }),
     )
     row1.append(navGroup)
 
-    // Chrome Tab Strip
     const tabStripWrap = document.createElement('div')
     tabStripWrap.className = cls('tabStripWrap')
-    markWindowRegion(tabStripWrap, true)
+    excludeFromWindowDrag(tabStripWrap)
 
-    const tabStrip = document.createElement('div')
-    tabStrip.className = cls('tabStrip')
-    markWindowRegion(tabStrip, false)
-
+    tabStrip.replaceChildren()
     for (const s of visibleTabs) {
       const tab = document.createElement('button')
       tab.type = 'button'
@@ -427,6 +534,7 @@ function mount(ctx: Context): () => void {
 
       tab.append(dot, tSpan)
       tab.onclick = () => openSessionById(s.id)
+      bindTabArrangement(tab, s, currentGroup, 'x')
       tabStrip.append(tab)
     }
 
@@ -441,22 +549,17 @@ function mount(ctx: Context): () => void {
       },
     })
 
-    const row1Spacer = document.createElement('div')
-    row1Spacer.className = cls('dragSpacer')
-    markWindowRegion(row1Spacer, true)
-
-    tabStripWrap.append(tabStrip, newTabBtn, allTabsBtn, row1Spacer)
+    tabStripWrap.append(tabStrip, newTabBtn, allTabsBtn)
     row1.append(tabStripWrap)
 
     // Classic Mac centered Workspace / Conversation pill
     const classicCenter = document.createElement('div')
     classicCenter.className = cls('classicCenter')
-    markWindowRegion(classicCenter, true)
 
     const classicPill = document.createElement('button')
     classicPill.type = 'button'
     classicPill.className = cls('classicPill')
-    markWindowRegion(classicPill, false)
+    excludeFromWindowDrag(classicPill)
     classicPill.title = t('chrome.switchSession')
     classicPill.setAttribute('aria-label', classicPill.title)
 
@@ -480,11 +583,12 @@ function mount(ctx: Context): () => void {
     }
     classicCenter.append(classicPill)
     row1.append(classicCenter)
+    if (captionGrip) row1.append(captionGrip)
 
-    // Top-Right Extension Bar (Plugins & Global Actions)
+    // Global actions share the workspace row in browser mode.
     const extBar = document.createElement('div')
     extBar.className = cls('extBar')
-    markWindowRegion(extBar, false)
+    excludeFromWindowDrag(extBar)
 
     const plugins = panels.find(panel => panel.id === 'plugins')
     const schedules = panels.find(panel => panel.id === 'schedules')
@@ -543,17 +647,15 @@ function mount(ctx: Context): () => void {
       divider,
       modeBtn,
     )
-    row1.append(extBar)
+    if (mode === 'classic') row1.append(extBar)
+    if (conversationGrip) row1.append(conversationGrip)
 
-    // --- Row 2: Chrome Bookmark Bar (Workspaces) ---
+    // Row 2: Workspaces, search, and global actions.
     row2.replaceChildren()
-    const wsBar = document.createElement('div')
-    wsBar.className = cls('wsBar')
-
+    wsBar.replaceChildren()
     for (const g of groups) {
       const chip = document.createElement('div')
       chip.className = cls('wsChip')
-      markWindowRegion(chip, false)
       if (g.id === currentGroup.id) chip.dataset.active = 'true'
 
       const mainBtn = document.createElement('button')
@@ -602,13 +704,9 @@ function mount(ctx: Context): () => void {
       wsBar.append(chip)
     }
 
-    const row2Spacer = document.createElement('div')
-    row2Spacer.className = cls('dragSpacer')
-    markWindowRegion(row2Spacer, true)
-
     const row2Right = document.createElement('div')
     row2Right.className = cls('navGroup')
-    markWindowRegion(row2Right, false)
+    excludeFromWindowDrag(row2Right)
 
     const searchBtn = makeIconButton(t('chrome.search'), t('chrome.searchHint'), {
       onClick: (e) => {
@@ -618,7 +716,12 @@ function mount(ctx: Context): () => void {
     })
     row2Right.append(searchBtn)
 
-    row2.append(wsBar, row2Spacer, row2Right)
+    row2.append(wsBar)
+    if (workspaceGrip) row2.append(workspaceGrip)
+    row2.append(row2Right)
+    if (mode === 'browser') row2.append(extBar)
+    tabStrip.scrollLeft = tabScrollLeft
+    wsBar.scrollLeft = workspaceScrollLeft
   }
 
   // The SDK retains the new main view before releasing the old one. Render once
@@ -649,10 +752,18 @@ function mount(ctx: Context): () => void {
     }
   }
   document.addEventListener('pointerdown', onDocPointerDown)
+  const onStorage = (event: StorageEvent): void => {
+    if (event.key !== TAB_ORDER_STORAGE_KEY && event.key !== null) return
+    tabOrders = readTabOrders(readStorage(TAB_ORDER_STORAGE_KEY))
+    scheduleRender()
+  }
+  window.addEventListener('storage', onStorage)
 
   return () => {
     disposed = true
     document.removeEventListener('pointerdown', onDocPointerDown)
+    window.removeEventListener('storage', onStorage)
+    tabDrag.reset()
     for (const stop of stopWatching) stop()
     closeDropdown()
     body.removeAttribute('data-dsh-workspace-tabs')

@@ -10,7 +10,11 @@ Status: implemented
 
 扩展位于 `packages/dsh-workspace-tabs`，包名为 `@linxin666/dsh-client-ui-workspace-tabs`。它是可选的浏览器端 Cordis 插件，不包含宿主端行为，不发布 npm，也不默认加入聚合包。浏览器代码共同负责导航和限定作用域的样式，使用上游共享构建预设及当前 SDK 队列。
 
-原生拖动属性与 CSS 仅对报告 `data-platform="darwin"` 的宿主生效。其他平台保留导航控件。安装、语言和宿主要求由包 README 维护。
+原生拖动使用独立的 macOS 窗口握柄。会话和工作区滚动条按外层容器的可见边界排除拖动，避免滚出视口的标签参与 Electron 拖动区域的合成。安装、语言和宿主要求由包 README 维护。
+
+标签、计数和搜索沿用原生侧栏的 `origin` 过滤口径。查看子 Agent 时，顶栏定位所属的主会话。普通 fork 即使带有父会话 ID，也仍作为独立会话展示。
+
+顶栏按工作区保存浏览器本地的会话标签顺序。新增会话按最近活动显示在已排好位置的标签前面，归档会话恢复时沿用其已保存的顺序。
 
 ## Alternatives considered
 

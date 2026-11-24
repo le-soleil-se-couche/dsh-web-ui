@@ -11,6 +11,7 @@ import { en, NS, zh } from '../src/client/locales.ts'
 const chrome = '[data-skin-chrome="titlebar"]'
 const dropdown = '[data-skin-chrome="dropdown"]'
 const selectedWorkspace = 'dsh-workspace-tabs:selected-workspace'
+const tabOrder = 'dsh-workspace-tabs:tab-order'
 const timestamp = Date.UTC(2026, 10, 13, 10)
 const dev = 'ws-dev' as WorkspaceId
 const notes = 'ws-notes' as WorkspaceId
@@ -166,6 +167,13 @@ function tabs(): string[] {
     .map(element => element.textContent ?? '')
 }
 
+function dragEvent(button: HTMLButtonElement, type: string, transfer: object, clientX = 0): MouseEvent {
+  const event = new MouseEvent(type, { bubbles: true, cancelable: true, clientX })
+  Object.defineProperty(event, 'dataTransfer', { value: transfer })
+  button.dispatchEvent(event)
+  return event
+}
+
 afterEach(async () => {
   for (const fiber of fibers.splice(0).reverse()) await fiber.dispose()
   document.body.replaceChildren()
@@ -196,21 +204,52 @@ describe('Workspace Tabs', () => {
     expect(document.body.firstElementChild).toBe(native)
   })
 
-  it('user on macOS can drag the chrome and use the workspace menu', async () => {
+  it('user on macOS gets separate drag areas and can use the workspace menu', async () => {
     // Given a macOS desktop.
     document.documentElement.dataset.platform = 'darwin'
     const host = createHost()
     seed(host)
     const plugin = await host.mount()
+    const tab = button('Polish the interface')
+    const tabScroll = tab.parentElement!
+    const workspaceScroll = button('Switch workspace: Dev').closest<HTMLElement>('[data-no-drag]')!
+    tabScroll.scrollLeft = 240
+    workspaceScroll.scrollLeft = 120
 
-    // When the user opens a workspace menu in the browser bar.
+    // When the user selects a conversation and opens a workspace menu.
+    tab.click()
+    await Promise.resolve()
     button('Show conversations in Dev').click()
 
-    // Then only the surrounding chrome is draggable and the popup can receive clicks.
-    expect(document.querySelector(chrome)?.getAttribute('data-window-drag')).toBe('true')
+    // Then each space for moving the window is a direct child of its row, outside the scrollers.
+    const titlebar = document.querySelector(chrome)!
+    const spacers = [...titlebar.querySelectorAll('[data-window-drag]')]
+    const [captionGrip, conversationGrip, workspaceGrip] = spacers
+    const [conversationRow, workspaceRow] = titlebar.children
+    expect(titlebar.hasAttribute('data-window-drag')).toBe(false)
+    expect(spacers).toHaveLength(3)
+    expect(spacers.every(spacer => spacer.getAttribute('aria-hidden') === 'true')).toBe(true)
+    expect(captionGrip?.parentElement).toBe(conversationRow)
+    expect(conversationGrip?.parentElement).toBe(conversationRow)
+    expect(workspaceGrip?.parentElement).toBe(workspaceRow)
+    expect(conversationGrip?.nextElementSibling).toBeNull()
+    expect(workspaceGrip?.nextElementSibling?.getAttribute('data-no-drag')).toBe('true')
+
+    // And the conversation strip and workspace strip still receive input.
+    const activeTab = button('Polish the interface')
+    expect(tabScroll.scrollLeft).toBe(240)
+    expect(workspaceScroll.scrollLeft).toBe(120)
+    expect(activeTab.dataset.active).toBe('true')
+    const tabRegion = activeTab.closest('[data-no-drag]')
+    expect(tabRegion?.parentElement).toBe(conversationRow)
+    expect(tabRegion?.querySelector('[data-no-drag]')).toBeNull()
+    expect(workspaceScroll.querySelector('[data-no-drag]')).toBeNull()
+    expect(workspaceScroll.nextElementSibling).toBe(workspaceGrip)
     expect(document.querySelector(dropdown)?.getAttribute('data-no-drag')).toBe('true')
     button('New conversation in Dev', dropdown).click()
     expect(host.startSession.mock.calls).toEqual([[dev]])
+    button(en['chrome.classicHint']).click()
+    expect(conversationRow?.lastElementChild).toBe(conversationGrip)
     await plugin.dispose()
     expect(document.querySelectorAll('[data-skin-chrome]')).toHaveLength(0)
   })
@@ -220,14 +259,21 @@ describe('Workspace Tabs', () => {
     if (platform) document.documentElement.dataset.platform = platform
     const host = createHost()
     await host.mount()
+    expect(document.querySelectorAll('[data-window-drag], [data-no-drag]')).toHaveLength(0)
+    expect(document.querySelectorAll(`${chrome} > div > [aria-hidden="true"]`)).toHaveLength(0)
+    const [conversationRow, workspaceRow] = document.querySelector(chrome)!.children
+    expect(workspaceRow?.contains(button(en['chrome.classicHint']))).toBe(true)
 
     // When the user selects the classic bar.
     button(en['chrome.classicHint']).click()
 
-    // Then the bar switches without emitting native drag attributes.
+    // Then the return control moves to the visible row.
     expect(document.body.dataset.workspaceTabsMode).toBe('classic')
-    expect(button(en['chrome.browserHint']).disabled).toBe(false)
+    const returnToTabs = button(en['chrome.browserHint'])
+    expect(conversationRow?.contains(returnToTabs)).toBe(true)
     expect(document.querySelectorAll('[data-window-drag], [data-no-drag]')).toHaveLength(0)
+    returnToTabs.click()
+    expect(workspaceRow?.contains(button(en['chrome.classicHint']))).toBe(true)
   })
 
   it('user gets a clean session window title and keeps a later shell title on disable', async () => {
@@ -272,6 +318,101 @@ describe('Workspace Tabs', () => {
     expect(host.startSession.mock.calls).toEqual([[home]])
   })
 
+  it('user drags a conversation before another and keeps that order after reopening the bar', async () => {
+    // Given two visible Dev conversations ordered by recency.
+    const host = createHost()
+    seed(host)
+    const plugin = await host.mount()
+    const source = button('Fix plugin tests')
+    const target = button('Polish the interface')
+    const beforeTarget = target.getBoundingClientRect().left - 1
+    const transfer = { effectAllowed: '', dropEffect: '', setData: vi.fn() }
+
+    // When the user drops the second tab on the left half of the first tab.
+    dragEvent(source, 'dragstart', transfer)
+    const over = dragEvent(target, 'dragover', transfer, beforeTarget)
+    expect(over.defaultPrevented).toBe(true)
+    expect(target.dataset.tabDrop).toBe('before')
+    dragEvent(target, 'drop', transfer, beforeTarget)
+    await plugin.dispose()
+    const reopened = createHost()
+    seed(reopened)
+    await reopened.mount()
+
+    // Then the reopened bar retains the new positions and the same conversation stays open.
+    expect(tabs()).toEqual(['Fix plugin tests', 'Polish the interface'])
+    expect(button('Fix plugin tests').dataset.active).toBe('true')
+    expect(JSON.parse(localStorage.getItem(tabOrder)!)).toEqual({ [dev]: [first, second] })
+  })
+
+  it('user can move a conversation from the overflow list using its keyboard context menu', async () => {
+    // Given the classic bar exposes conversations through the switcher.
+    const host = createHost()
+    seed(host)
+    await host.mount()
+    button(en['chrome.classicHint']).click()
+    button(en['chrome.switchSession']).click()
+    const recent = button('Polish the interface', dropdown)
+
+    // When the user opens its menu and moves it one position later.
+    recent.dispatchEvent(new KeyboardEvent('keydown', { key: 'F10', shiftKey: true, bubbles: true, cancelable: true }))
+    expect(button(en['session.moveEarlier'], dropdown).disabled).toBe(true)
+    button(en['session.moveLater'], dropdown).click()
+
+    // Then reopening the list reflects the new order.
+    button(en['chrome.switchSession']).click()
+    const labels = [...document.querySelectorAll(dropdown + ' button[class*="ddItem"]')]
+      .map(el => el.querySelector('[class*="ddItemTitle"]')?.textContent)
+    expect(labels).toEqual(['Fix plugin tests', 'Polish the interface'])
+  })
+
+  it('user sees top-level conversations in counts, tabs, and search while viewing a nested subagent', async () => {
+    // Given both catalog and retained subagents, plus an ordinary fork with a parent ID.
+    const host = createHost()
+    seed(host)
+    const fork = session('fork' as SessionSummary['id'], 'Independent fork', 1, { parentId: first })
+    const child = session('child' as SessionSummary['id'], 'Subagent grouped', 0, { origin: 'subagent', parentId: first })
+    const nested = session('nested' as SessionSummary['id'], 'Subagent retained', 0, { origin: 'subagent', parentId: child.id })
+    const orphan = session('orphan' as SessionSummary['id'], 'Subagent unassigned', 0, { origin: 'subagent' })
+    const ungrouped = session('loose' as SessionSummary['id'], 'Unassigned notes', 3)
+    const snapshot = host.sessions.getSnapshot()
+    host.sessions.set({
+      ...snapshot,
+      ids: [...snapshot.ids, fork.id, child.id, orphan.id, ungrouped.id],
+      byId: { ...snapshot.byId, ...Object.fromEntries([fork, child, nested, orphan, ungrouped].map(row => [row.id, row])) },
+    })
+    const registry = host.workspaces.getSnapshot()
+    host.workspaces.set({
+      ...registry,
+      items: registry.items.map(item => item.workspaceId === dev
+        ? { ...item, sessionIds: [...item.sessionIds, fork.id, child.id] }
+        : item),
+    })
+    localStorage.setItem(selectedWorkspace, '__ungrouped__')
+    host.retainMain(nested.id)
+
+    // When the bar opens on the nested subagent and searches for child titles.
+    await host.mount()
+    expect(tabs()).toEqual(['Independent fork', 'Polish the interface', 'Fix plugin tests'])
+    expect(button('Fix plugin tests').dataset.active).toBe('true')
+    expect(button('Switch workspace: Dev').parentElement?.dataset.active).toBe('true')
+    expect(button('Switch workspace: Dev').textContent).toBe('Dev3')
+    expect(button('Switch workspace: Ungrouped').textContent).toBe('Ungrouped1')
+    button('Show all conversations in Dev (3)').click()
+    expect(document.querySelector(dropdown)?.textContent).not.toContain('Subagent')
+    const search = document.querySelector<HTMLInputElement>(dropdown + ' input')!
+    search.value = 'Subagent'
+    search.dispatchEvent(new Event('input'))
+
+    // Then search hides all child rows, and history only tracks the owning conversation.
+    expect(document.querySelector(dropdown)?.textContent).toContain(en['session.noMatches'])
+    expect(button(en['session.back']).disabled).toBe(true)
+    search.value = 'Unassigned notes'
+    search.dispatchEvent(new Event('input'))
+    expect(document.querySelector(dropdown)?.textContent).toContain('[Ungrouped] Unassigned notes')
+    expect(host.sessions.getSnapshot().byId[nested.id]?.retainedBy.mainView).toBe(1)
+  })
+
   it('user switches to the result’s workspace when searching from another workspace', async () => {
     // Given conversations in separate workspaces.
     const host = createHost()
@@ -310,7 +451,9 @@ describe('Workspace Tabs', () => {
     await host.mount()
 
     // When the user opens More, selects the board, and toggles the sidebar.
-    button(en['panel.moreHint']).click()
+    const more = button(en['panel.moreHint'])
+    expect(document.querySelector(chrome)?.lastElementChild?.contains(more)).toBe(true)
+    more.click()
     expect(document.querySelector(dropdown)?.textContent).toContain('Global panels (2)')
     expect(document.querySelector(dropdown)?.textContent).not.toContain('Orphan')
     button('Custom Board', dropdown).click()
@@ -356,6 +499,46 @@ describe('Workspace Tabs', () => {
 
     // Then usage and remote land on their own surfaces.
     expect(state).toEqual({ open: true, section: 'dsh-usage', clicked: 'remote' })
+  })
+
+  it('user opens dsh-all-usage and ds-harness-remote from their exact footer triggers', async () => {
+    // Given standalone dsh-all-usage and ds-harness-remote registrations without native settings or dsh-usage.
+    const host = createHost()
+    const clicks: string[] = []
+    host.slotEntries('sidebar.footer.action').set([
+      slot({ id: 'all-usage', order: 10 }),
+      slot({ id: 'ds-harness-remote-workspace', order: -20 }),
+    ])
+    const footer = document.createElement('div')
+    const unrelated = document.createElement('button')
+    unrelated.onclick = () => { clicks.push('unrelated') }
+    const allUsageBtn = document.createElement('button')
+    allUsageBtn.className = 'uh-side-entry'
+    allUsageBtn.onclick = () => { clicks.push('all-usage') }
+    const remoteModeBtn = document.createElement('button')
+    remoteModeBtn.className = 'dshRemoteModeButton'
+    remoteModeBtn.onclick = () => { clicks.push('remote-standard') }
+    footer.append(unrelated, allUsageBtn, remoteModeBtn)
+    document.body.append(footer)
+    await host.mount()
+
+    // When the user clicks the topbar usage and remote shortcuts.
+    expect(button(en['panel.usageHint']).disabled).toBe(false)
+    expect(button(en['panel.remoteHint']).disabled).toBe(false)
+    button(en['panel.usageHint']).click()
+    button(en['panel.remoteHint']).click()
+
+    // Then each shortcut clicks only its own plugin control and ignores unrelated buttons.
+    expect(clicks).toEqual(['all-usage', 'remote-standard'])
+
+    // And when ds-harness-remote switches to its compact account-row entry, that button works too.
+    remoteModeBtn.remove()
+    const remoteCompactBtn = document.createElement('button')
+    remoteCompactBtn.className = 'dshRemoteAccountEntryButton'
+    remoteCompactBtn.onclick = () => { clicks.push('remote-compact') }
+    footer.append(remoteCompactBtn)
+    button(en['panel.remoteHint']).click()
+    expect(clicks).toEqual(['all-usage', 'remote-standard', 'remote-compact'])
   })
 
   it('user sees unavailable optional shortcuts disabled and can still change bar layout', async () => {
